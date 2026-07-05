@@ -97,10 +97,4 @@ A static 64-bit binary is also included in the repository.
 - Original files can be securely shredded after encryption (enabled by default).
 - Authentication tags are verified on every chunk during decryption and verification.
 
-## License
 
-[License to be specified by the project owner]
-
-## Author
-
-[Author information to be specified]
