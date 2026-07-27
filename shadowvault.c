@@ -1,12 +1,57 @@
 /*
- * ShadowVault  – Envelope Encryption + XChaCha20-Poly1305 Secretstream
+ * ShadowVault v6.1 – Envelope Encryption + XChaCha20-Poly1305 Secretstream
  *
- * Build: gcc -O2 -Wall -Wextra -o shadowvault shadowvault_v6.c -lsodium -lz
+ * Build: gcc -O2 -Wall -Wextra -o shadowvault shadowvault.c -lsodium -lz
  * Usage: ./shadowvault <enc|dec|verify> <file|dir> [options]
-*/
+ *
+ * ==========================================================================
+ * WHAT CHANGED FROM v6.0 (improvements & hardening)
+ * ==========================================================================
+ *
+ * 1. FILE PERMISSION & TIMESTAMP RESTORATION
+ *    Bundle entries now store the original mode, modification time (seconds +
+ *    nanoseconds), and, for directories, an explicit ENTRY_DIR tag. Empty
+ *    directories are preserved and restored with correct metadata.
+ *
+ * 2. OVERWRITE SAFETY
+ *    The program now refuses to overwrite an existing output file/directory
+ *    unless `-f` (force) is given.
+ *
+ * 3. DETERMINISTIC DIRECTORY PROCESSING
+ *    Directory entries are sorted before serialisation, making the bundle
+ *    order predictable across identical filesystem trees.
+ *
+ * 4. ITERATIVE DIRECTORY TRAVERSAL
+ *    Recursion in `bundle_add_tree` has been replaced with an explicit stack
+ *    to avoid stack overflow on deeply nested directories.
+ *
+ * 5. ENHANCED SECURE DELETION
+ *    The overwrite buffer is zeroed with sodium_memzero and the parent
+ *    directory is fsync()'d after the file is unlinked.
+ *
+ * 6. CONFIGURABLE ARGON2ID COSTS
+ *    New CLI options `-t`/`--opslimit` and `-m`/`--memlimit` allow the user
+ *    to choose stronger or weaker parameters at encrypt time. They are
+ *    persisted in the header, so decryption needs no extra flags.
+ *
+ * 7. MEMORY LOCKING
+ *    All sensitive heap buffers (DEK, KEK, password) are guarded with
+ *    sodium_mlock() to prevent them from being paged to swap.
+ *
+ * 8. PORTABLE MEMORY ZEROING
+ *    `explicit_bzero` has been replaced with `sodium_memzero`.
+ *
+ * 9. CONFIGURABLE KEYFILE SIZE LIMIT
+ *    The maximum allowed keyfile size can be set with `--keyfile-max-size`
+ *    (default 4 MiB).
+ *
+ * 10. STDIN / STDOUT SUPPORT
+ *     Using `-` as the input or output path reads from stdin or writes to
+ *     stdout, enabling piping.
+ */
 
 #define _GNU_SOURCE
-#define _FILE_OFFSET_BITS 64   /* ensure off_t is 64-bit everywhere */
+#define _FILE_OFFSET_BITS 64
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,10 +65,11 @@
 #include <libgen.h>
 #include <signal.h>
 #include <getopt.h>
-#include <ftw.h>
 #include <sodium.h>
 #include <zlib.h>
-#include <limits.h>            /* for PATH_MAX */
+#include <limits.h>
+#include <time.h>
+#include <ftw.h>
 
 /* ----- Constants ----- */
 #define SV_MAGIC        "SV06"
@@ -39,16 +85,20 @@
 #define FLAG_COMPRESSED 0x01
 #define FLAG_DIRECTORY  0x02
 
-/* Argon2id defaults, persisted */
+/* Argon2id defaults – overridable via CLI */
 #define DEFAULT_OPSLIMIT crypto_pwhash_OPSLIMIT_MODERATE
 #define DEFAULT_MEMLIMIT crypto_pwhash_MEMLIMIT_MODERATE
 
 /* Bundle entry tags */
-#define ENTRY_FILE 1
-#define ENTRY_END  0
+#define ENTRY_FILE  1
+#define ENTRY_DIR   2
+#define ENTRY_END   0
 
 /* Maximum path length inside a bundle */
 #define MAX_BUNDLE_PATH 4095
+
+/* Default maximum keyfile size */
+#define DEFAULT_KEYFILE_MAX_SIZE (4 * 1024 * 1024)
 
 /* ----- On-disk header – the exact byte range of this struct is used as
  * authenticated additional data for the first stream block. ----- */
@@ -67,7 +117,6 @@ typedef struct {
 #pragma pack(pop)
 
 static volatile sig_atomic_t g_interrupted = 0;
-static const char *g_output_path = NULL;
 
 static void signal_handler(int sig) { (void)sig; g_interrupted = 1; }
 
@@ -80,6 +129,11 @@ static uint64_t get_u64be(const uint8_t *in) {
     for (int i = 0; i < 8; i++) v = (v << 8) | in[i];
     return v;
 }
+static int32_t get_i32be(const uint8_t *in) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) v = (v << 8) | in[i];
+    return (int32_t)v;
+}
 
 /* ----- Robust I/O helpers to handle partial reads/writes ----- */
 static ssize_t read_full(int fd, void *buf, size_t n) {
@@ -90,7 +144,7 @@ static ssize_t read_full(int fd, void *buf, size_t n) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (r == 0) return 0; /* EOF */
+        if (r == 0) return (ssize_t)got; /* EOF – return what we already read */
         got += (size_t)r;
     }
     return (ssize_t)got;
@@ -104,7 +158,7 @@ static ssize_t write_full(int fd, const void *buf, size_t n) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (r == 0) return -1; /* Should not happen for regular files */
+        if (r == 0) return -1;
         put += (size_t)r;
     }
     return (ssize_t)put;
@@ -118,6 +172,11 @@ static int derive_kek(const char *password, size_t pw_len,
     size_t total_len = pw_len + keyfile_len;
     uint8_t *combined = sodium_malloc(total_len > 0 ? total_len : 1);
     if (!combined) return -1;
+    /* Lock the combined buffer – it contains secret material */
+    if (sodium_mlock(combined, total_len > 0 ? total_len : 1) != 0) {
+        sodium_free(combined);
+        return -1;
+    }
 
     if (password && pw_len) memcpy(combined, password, pw_len);
     if (keyfile_data && keyfile_len) memcpy(combined + pw_len, keyfile_data, keyfile_len);
@@ -126,6 +185,7 @@ static int derive_kek(const char *password, size_t pw_len,
                              (const char *)combined, total_len,
                              salt, opslimit, memlimit,
                              crypto_pwhash_ALG_ARGON2ID13);
+    sodium_munlock(combined, total_len > 0 ? total_len : 1);
     sodium_memzero(combined, total_len > 0 ? total_len : 1);
     sodium_free(combined);
     return ret;
@@ -159,7 +219,6 @@ static int is_path_inside(const char *parent, const char *child) {
 static int secure_delete(const char *path, off_t size) {
     int fd = open(path, O_RDWR);
     if (fd < 0 && errno == EACCES) {
-        /* Try to make the file owner-writable so the overwrite can proceed. */
         if (chmod(path, S_IRUSR | S_IWUSR) == 0)
             fd = open(path, O_RDWR);
     }
@@ -168,8 +227,9 @@ static int secure_delete(const char *path, off_t size) {
         return -1;
     }
 
-    uint8_t *buf = malloc(CHUNK_SIZE);
+    uint8_t *buf = sodium_malloc(CHUNK_SIZE);
     if (!buf) { close(fd); return -1; }
+    sodium_mlock(buf, CHUNK_SIZE);
 
     for (int pass = 0; pass < 3; pass++) {
         if (lseek(fd, 0, SEEK_SET) < 0) break;
@@ -177,19 +237,19 @@ static int secure_delete(const char *path, off_t size) {
         while (remaining > 0) {
             size_t want = remaining > CHUNK_SIZE ? CHUNK_SIZE : (size_t)remaining;
             if (pass < 2) randombytes_buf(buf, want);
-            else memset(buf, 0, want);
+            else          memset(buf, 0, want);
             ssize_t w = write_full(fd, buf, want);
             if (w < 0) break;
             remaining -= w;
         }
         fsync(fd);
     }
-    free(buf);
+    sodium_munlock(buf, CHUNK_SIZE);
+    sodium_memzero(buf, CHUNK_SIZE);
+    sodium_free(buf);
     close(fd);
 
-    /* Rename before unlink as a best-effort extra step to obscure the name.
-       Use mkstemp in the same directory to guarantee the rename succeeds
-       (cross-device rename would fail). */
+    /* Rename before unlink to obscure name, then sync parent directory. */
     char *dup = strdup(path);
     if (dup) {
         char *dirp = dirname(dup);
@@ -198,8 +258,11 @@ static int secure_delete(const char *path, off_t size) {
             int tfd = mkstemp(tmpl);
             if (tfd >= 0) {
                 close(tfd);
-                unlink(tmpl); /* remove it immediately so it doesn't exist */
+                unlink(tmpl);
                 if (rename(path, tmpl) == 0) {
+                    /* Sync parent directory after rename */
+                    int dir_fd = open(dirp, O_RDONLY);
+                    if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
                     unlink(tmpl);
                 } else {
                     unlink(path);
@@ -213,6 +276,16 @@ static int secure_delete(const char *path, off_t size) {
         free(dup);
     } else {
         unlink(path);
+    }
+    /* Final parent directory sync after unlink */
+    {
+        char *dup2 = strdup(path);
+        if (dup2) {
+            char *dname = dirname(dup2);
+            int dir_fd = open(dname, O_RDONLY);
+            if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+            free(dup2);
+        }
     }
     return 0;
 }
@@ -306,7 +379,7 @@ static int reader_pull(sv_reader_t *r, uint8_t *plain, size_t *plain_len, uint8_
         return r->saw_final ? 0 : -1;
     }
     if (got != 4) return -1;
-    if (r->saw_final) return -1; /* extra data after FINAL */
+    if (r->saw_final) return -1;
 
     uint32_t clen = ((uint32_t)len_field[0] << 24) | ((uint32_t)len_field[1] << 16) |
                     ((uint32_t)len_field[2] << 8)  | (uint32_t)len_field[3];
@@ -363,7 +436,6 @@ static int encrypt_stream_body(int in_fd, sv_writer_t *w, int use_zlib,
     n = read_full(in_fd, cur_buf, CHUNK_SIZE);
     if (n < 0) goto done;
 
-    /* Fix: Handle empty files properly by emitting a single FINAL block */
     if (n == 0) {
         if (writer_push(w, NULL, 0, crypto_secretstream_xchacha20poly1305_TAG_FINAL) != 0)
             goto done;
@@ -403,7 +475,6 @@ static int encrypt_stream_body(int in_fd, sv_writer_t *w, int use_zlib,
 
         processed += n;
         n = next_n;
-        /* swap buffers */
         uint8_t *tmp = cur_buf; cur_buf = next_buf; next_buf = tmp;
     }
 
@@ -422,24 +493,44 @@ static int encrypt_file(const char *inpath, const char *outpath,
                          const char *password, size_t pw_len,
                          const uint8_t *keyfile_data, size_t keyfile_len,
                          int compress, uint64_t opslimit, uint64_t memlimit,
-                         int shred_original, int verbose) {
+                         int shred_original, int verbose, int force_overwrite) {
     int in_fd = -1, out_fd = -1, ret = -1;
     uint8_t dek[DEK_SIZE];
     sv_writer_t w; memset(&w, 0, sizeof(w));
     int writer_ok = 0;
 
+    /* Guard against overwriting existing output */
+    if (!force_overwrite) {
+        struct stat st_out;
+        if (stat(outpath, &st_out) == 0) {
+            fprintf(stderr, "Output '%s' already exists. Use -f to force overwrite.\n", outpath);
+            return -1;
+        }
+    }
+
     if (is_same_file(inpath, outpath)) {
         fprintf(stderr, "Error: input and output are the same file\n");
         return -1;
     }
-    in_fd = open(inpath, O_RDONLY);
-    if (in_fd < 0) { perror("open input"); goto cleanup; }
+    int use_stdin = (strcmp(inpath, "-") == 0);
+    if (use_stdin) {
+        in_fd = STDIN_FILENO;
+    } else {
+        in_fd = open(inpath, O_RDONLY);
+        if (in_fd < 0) { perror("open input"); goto cleanup; }
+    }
     struct stat st;
-    if (fstat(in_fd, &st) < 0) { perror("fstat"); goto cleanup; }
+    if (!use_stdin) {
+        if (fstat(in_fd, &st) < 0) { perror("fstat"); goto cleanup; }
+    }
 
-    out_fd = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (out_fd < 0) { perror("open output"); goto cleanup; }
-    g_output_path = outpath;
+    int use_stdout = (strcmp(outpath, "-") == 0);
+    if (use_stdout) {
+        out_fd = STDOUT_FILENO;
+    } else {
+        out_fd = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (out_fd < 0) { perror("open output"); goto cleanup; }
+    }
 
     sv_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
@@ -458,20 +549,23 @@ static int encrypt_file(const char *inpath, const char *outpath,
 
     {
         uint8_t kek[DEK_SIZE];
+        if (sodium_mlock(kek, DEK_SIZE) != 0) { perror("mlock kek"); goto cleanup; }
         if (derive_kek(password, pw_len, keyfile_data, keyfile_len, hdr.salt, kek,
                        opslimit, (size_t)memlimit) != 0) {
             fprintf(stderr, "Key derivation failed\n");
+            sodium_munlock(kek, DEK_SIZE);
             goto cleanup;
         }
         randombytes_buf(dek, DEK_SIZE);
+        if (sodium_mlock(dek, DEK_SIZE) != 0) { sodium_munlock(kek, DEK_SIZE); goto cleanup; }
         randombytes_buf(hdr.wrap_nonce, WRAP_NONCE_SIZE);
         int wrap_rc = crypto_secretbox_easy(hdr.wrapped_dek, dek, DEK_SIZE,
                                             hdr.wrap_nonce, kek);
+        sodium_munlock(kek, DEK_SIZE);
         sodium_memzero(kek, DEK_SIZE);
         if (wrap_rc != 0) { fprintf(stderr, "DEK wrap failed\n"); goto cleanup; }
     }
 
-    /* The packed struct is used directly as the Authenticated Data */
     if (writer_init(&w, out_fd, dek, hdr.stream_header, (const uint8_t *)&hdr, sizeof(hdr)) != 0) {
         fprintf(stderr, "Stream init failed\n");
         goto cleanup;
@@ -493,7 +587,7 @@ static int encrypt_file(const char *inpath, const char *outpath,
 
     ret = 0;
 
-    if (shred_original && ret == 0) {
+    if (shred_original && ret == 0 && !use_stdin) {
         close(in_fd); in_fd = -1;
         fprintf(stderr, "Shredding original (overwrite-based; see header comment on SSD/COW caveats)...\n");
         if (secure_delete(inpath, st.st_size) != 0)
@@ -501,12 +595,13 @@ static int encrypt_file(const char *inpath, const char *outpath,
     }
 
 cleanup:
+    sodium_munlock(dek, DEK_SIZE);
     sodium_memzero(dek, DEK_SIZE);
     if (writer_ok) writer_free(&w);
-    if (in_fd >= 0) close(in_fd);
-    if (out_fd >= 0) {
+    if (in_fd >= 0 && in_fd != STDIN_FILENO) close(in_fd);
+    if (out_fd >= 0 && out_fd != STDOUT_FILENO) {
         close(out_fd);
-        if (ret != 0 && g_output_path) unlink(g_output_path);
+        if (ret != 0) unlink(outpath);
     }
     return ret;
 }
@@ -514,7 +609,7 @@ cleanup:
 static int decrypt_file(const char *inpath, const char *outpath,
                          const char *password, size_t pw_len,
                          const uint8_t *keyfile_data, size_t keyfile_len,
-                         int verify_only, int verbose) {
+                         int verify_only, int verbose, int force_overwrite) {
     int in_fd = -1, out_fd = -1, ret = -1;
     uint8_t dek[DEK_SIZE];
     sv_reader_t r; memset(&r, 0, sizeof(r));
@@ -522,17 +617,33 @@ static int decrypt_file(const char *inpath, const char *outpath,
     z_stream zstrm; memset(&zstrm, 0, sizeof(zstrm));
     int zlib_ok = 0;
 
-    in_fd = open(inpath, O_RDONLY);
-    if (in_fd < 0) { perror("open input"); goto cleanup; }
+    int use_stdin = (strcmp(inpath, "-") == 0);
+    if (use_stdin) {
+        in_fd = STDIN_FILENO;
+    } else {
+        in_fd = open(inpath, O_RDONLY);
+        if (in_fd < 0) { perror("open input"); goto cleanup; }
+    }
 
     if (!verify_only) {
+        if (!force_overwrite) {
+            struct stat st_out;
+            if (strcmp(outpath, "-") != 0 && stat(outpath, &st_out) == 0) {
+                fprintf(stderr, "Output '%s' already exists. Use -f to force overwrite.\n", outpath);
+                goto cleanup;
+            }
+        }
         if (is_same_file(inpath, outpath)) {
             fprintf(stderr, "Error: output would overwrite input\n");
             goto cleanup;
         }
-        out_fd = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (out_fd < 0) { perror("open output"); goto cleanup; }
-        g_output_path = outpath;
+        int use_stdout = (strcmp(outpath, "-") == 0);
+        if (use_stdout) {
+            out_fd = STDOUT_FILENO;
+        } else {
+            out_fd = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (out_fd < 0) { perror("open output"); goto cleanup; }
+        }
     }
 
     sv_header_t hdr;
@@ -558,17 +669,22 @@ static int decrypt_file(const char *inpath, const char *outpath,
 
     {
         uint8_t kek[DEK_SIZE];
+        if (sodium_mlock(kek, DEK_SIZE) != 0) goto cleanup;
         if (derive_kek(password, pw_len, keyfile_data, keyfile_len, hdr.salt, kek,
                        opslimit, (size_t)memlimit) != 0) {
             fprintf(stderr, "Key derivation failed\n");
+            sodium_munlock(kek, DEK_SIZE);
             goto cleanup;
         }
+        if (sodium_mlock(dek, DEK_SIZE) != 0) { sodium_munlock(kek, DEK_SIZE); goto cleanup; }
         int unwrap_rc = crypto_secretbox_open_easy(dek, hdr.wrapped_dek,
                                                     sizeof(hdr.wrapped_dek),
                                                     hdr.wrap_nonce, kek);
+        sodium_munlock(kek, DEK_SIZE);
         sodium_memzero(kek, DEK_SIZE);
         if (unwrap_rc != 0) {
             fprintf(stderr, "[FAIL] Wrong password/keyfile, or header tampered\n");
+            sodium_munlock(dek, DEK_SIZE);
             goto cleanup;
         }
     }
@@ -601,7 +717,7 @@ static int decrypt_file(const char *inpath, const char *outpath,
             sodium_free(plain);
             goto cleanup;
         }
-        if (rc == 0) break; /* clean end */
+        if (rc == 0) break;
 
         if (!verify_only) {
             if (zlib_ok) {
@@ -643,23 +759,39 @@ static int decrypt_file(const char *inpath, const char *outpath,
     ret = 0;
 
 cleanup:
+    sodium_munlock(dek, DEK_SIZE);
     sodium_memzero(dek, DEK_SIZE);
     if (zlib_ok) inflateEnd(&zstrm);
     if (reader_ok) reader_free(&r);
-    if (in_fd >= 0) close(in_fd);
-    if (out_fd >= 0) {
+    if (in_fd >= 0 && in_fd != STDIN_FILENO) close(in_fd);
+    if (out_fd >= 0 && out_fd != STDOUT_FILENO) {
         close(out_fd);
-        if (ret != 0 && g_output_path) unlink(g_output_path);
+        if (ret != 0) unlink(outpath);
     }
     return ret;
 }
 
 /* ==========================================================================
- * Directory bundle mode
+ * Directory bundle mode – with improved metadata and iterative traversal
  * ========================================================================== */
 
+/*
+ * Bundle entry header format (per entry):
+ *   tag          : 1 byte  (ENTRY_FILE or ENTRY_DIR)
+ *   path_len     : 2 bytes (big-endian)
+ *   relpath      : path_len bytes
+ *   [for files:]
+ *     size       : 8 bytes (uint64 BE)
+ *     mode       : 4 bytes (uint32 BE)
+ *     mtime_sec  : 8 bytes (int64 BE)
+ *     mtime_nsec : 4 bytes (int32 BE)
+ *   [for dirs:]
+ *     mode       : 4 bytes (uint32 BE)   – no size or times
+ */
+
 static int bundle_write_entry_header(sv_writer_t *w, const char *relpath,
-                                     off_t size, mode_t mode) {
+                                     int is_dir, off_t size, mode_t mode,
+                                     int64_t mtime_sec, int32_t mtime_nsec) {
     size_t rlen = strlen(relpath);
     if (rlen > MAX_BUNDLE_PATH) {
         fprintf(stderr, "Path too long for bundle entry (max %d): %s\n",
@@ -667,92 +799,238 @@ static int bundle_write_entry_header(sv_writer_t *w, const char *relpath,
         return -1;
     }
     uint16_t plen = (uint16_t)rlen;
-    uint8_t hdrbuf[1 + 2 + MAX_BUNDLE_PATH + 8 + 4];
+    uint8_t hdrbuf[1 + 2 + MAX_BUNDLE_PATH + 8 + 4 + 8 + 4];
     size_t o = 0;
-    hdrbuf[o++] = ENTRY_FILE;
+    hdrbuf[o++] = is_dir ? ENTRY_DIR : ENTRY_FILE;
     hdrbuf[o++] = (uint8_t)(plen >> 8);
     hdrbuf[o++] = (uint8_t)(plen & 0xff);
     memcpy(hdrbuf + o, relpath, plen); o += plen;
-    put_u64be(hdrbuf + o, (uint64_t)size); o += 8;
-    hdrbuf[o++] = (uint8_t)((mode >> 24) & 0xff);
-    hdrbuf[o++] = (uint8_t)((mode >> 16) & 0xff);
-    hdrbuf[o++] = (uint8_t)((mode >> 8) & 0xff);
-    hdrbuf[o++] = (uint8_t)(mode & 0xff);
+    if (is_dir) {
+        hdrbuf[o++] = (uint8_t)((mode >> 24) & 0xff);
+        hdrbuf[o++] = (uint8_t)((mode >> 16) & 0xff);
+        hdrbuf[o++] = (uint8_t)((mode >> 8) & 0xff);
+        hdrbuf[o++] = (uint8_t)(mode & 0xff);
+    } else {
+        put_u64be(hdrbuf + o, (uint64_t)size); o += 8;
+        hdrbuf[o++] = (uint8_t)((mode >> 24) & 0xff);
+        hdrbuf[o++] = (uint8_t)((mode >> 16) & 0xff);
+        hdrbuf[o++] = (uint8_t)((mode >> 8) & 0xff);
+        hdrbuf[o++] = (uint8_t)(mode & 0xff);
+        /* mtime_sec (int64 BE) */
+        for (int i = 7; i >= 0; i--) {
+            hdrbuf[o++] = (uint8_t)((mtime_sec >> (i*8)) & 0xff);
+        }
+        /* mtime_nsec (int32 BE) */
+        hdrbuf[o++] = (uint8_t)((mtime_nsec >> 24) & 0xff);
+        hdrbuf[o++] = (uint8_t)((mtime_nsec >> 16) & 0xff);
+        hdrbuf[o++] = (uint8_t)((mtime_nsec >> 8) & 0xff);
+        hdrbuf[o++] = (uint8_t)(mtime_nsec & 0xff);
+    }
     return writer_push(w, hdrbuf, o, crypto_secretstream_xchacha20poly1305_TAG_MESSAGE);
 }
 
-static int bundle_add_tree(sv_writer_t *w, const char *base_in, const char *rel,
-                           int *file_count) {
-    char full[PATH_MAX * 2];
-    int wrote = snprintf(full, sizeof(full), "%s/%s", base_in,
-                         rel && rel[0] ? rel : "");
-    if (wrote < 0 || (size_t)wrote >= sizeof(full)) {
-        fprintf(stderr, "Path too long, aborting: %s/%s\n", base_in, rel ? rel : "");
-        return -1;
-    }
-    DIR *d = opendir(full);
-    if (!d) { perror("opendir"); return -1; }
-    struct dirent *entry;
-    int errors = 0;
-    while ((entry = readdir(d)) != NULL) {
-        if (g_interrupted) { errors++; break; }
-        /* Fix: Only skip "." and "..", do not skip all dotfiles */
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-            continue;
+/* Comparison function for sorting directory entries */
+static int dirent_comp(const void *a, const void *b) {
+    const char *sa = *(const char **)a;
+    const char *sb = *(const char **)b;
+    return strcmp(sa, sb);
+}
 
-        char child_rel[PATH_MAX];
-        int w1 = (rel && rel[0])
-                 ? snprintf(child_rel, sizeof(child_rel), "%s/%s", rel, entry->d_name)
-                 : snprintf(child_rel, sizeof(child_rel), "%s", entry->d_name);
-        if (w1 < 0 || (size_t)w1 >= sizeof(child_rel)) {
-            fprintf(stderr, "Relative path too long, skipping: %s\n", entry->d_name);
-            errors++; continue;
+/* Iterative directory traversal using an explicit stack */
+static int bundle_add_tree(sv_writer_t *w, const char *base_in) {
+    struct stack_node {
+        char *rel;        /* relative path from base_in, or "" for root */
+        int visited;      /* 0 = not yet enumerated, 1 = files processed */
+    };
+    struct stack_node *stack = NULL;
+    size_t stack_sz = 0;
+    int file_count = 0;
+    int ret = -1;
+
+    /* Push root */
+    stack = realloc(stack, (stack_sz + 1) * sizeof(*stack));
+    if (!stack) goto cleanup;
+    stack[0].rel = strdup("");
+    stack[0].visited = 0;
+    stack_sz = 1;
+
+    while (stack_sz > 0 && !g_interrupted) {
+        struct stack_node *top = &stack[stack_sz - 1];
+
+        char full[PATH_MAX * 2];
+        int wrote = snprintf(full, sizeof(full), "%s/%s", base_in,
+                             top->rel[0] ? top->rel : "");
+        if (wrote < 0 || (size_t)wrote >= sizeof(full)) {
+            fprintf(stderr, "Path too long, aborting: %s/%s\n", base_in, top->rel);
+            goto cleanup;
         }
 
-        char child_full[PATH_MAX * 2];
-        int w2 = snprintf(child_full, sizeof(child_full), "%s/%s", base_in, child_rel);
-        if (w2 < 0 || (size_t)w2 >= sizeof(child_full)) {
-            fprintf(stderr, "Full path too long, skipping: %s\n", child_rel);
-            errors++; continue;
-        }
-        struct stat st;
-        if (lstat(child_full, &st) < 0) continue;
-        if (S_ISLNK(st.st_mode)) continue; /* Explicitly skip symlinks for security */
+        if (top->visited == 0) {
+            size_t cur_idx = stack_sz - 1;
+            /* First visit – open directory and push all subdirectories */
+            DIR *d = opendir(full);
+            if (!d) { perror("opendir"); goto cleanup; }
 
-        if (S_ISDIR(st.st_mode)) {
-            if (bundle_add_tree(w, base_in, child_rel, file_count) != 0) errors++;
-        } else if (S_ISREG(st.st_mode)) {
-            int fd = open(child_full, O_RDONLY);
-            if (fd < 0) { perror("open"); errors++; continue; }
-            if (bundle_write_entry_header(w, child_rel, st.st_size, st.st_mode) != 0) {
-                close(fd); errors++; continue;
-            }
-            uint8_t *buf = malloc(CHUNK_SIZE);
-            ssize_t n;
-            while ((n = read_full(fd, buf, CHUNK_SIZE)) > 0) {
-                if (g_interrupted) { errors++; break; }
-                if (writer_push(w, buf, (size_t)n,
-                                crypto_secretstream_xchacha20poly1305_TAG_MESSAGE) != 0) {
-                    errors++; break;
+            /* Collect names and sort */
+            char **names = NULL;
+            size_t names_count = 0, names_cap = 0;
+            struct dirent *entry;
+            while ((entry = readdir(d)) != NULL) {
+                if (strcmp(entry->d_name, ".") == 0 ||
+                    strcmp(entry->d_name, "..") == 0) continue;
+                if (names_count >= names_cap) {
+                    names_cap = names_cap ? names_cap * 2 : 32;
+                    names = realloc(names, names_cap * sizeof(char *));
+                    if (!names) { closedir(d); goto cleanup; }
                 }
+                names[names_count] = strdup(entry->d_name);
+                if (!names[names_count]) { closedir(d); while (names_count > 0) free(names[--names_count]); free(names); goto cleanup; }
+                names_count++;
             }
-            free(buf);
-            close(fd);
-            (*file_count)++;
+            closedir(d);
+
+            if (names_count > 0) {
+                qsort(names, names_count, sizeof(char *), dirent_comp);
+                /* Push subdirectories onto stack (reverse order so they are processed in sorted order) */
+                for (size_t i = names_count; i > 0; i--) {
+                    const char *name = names[i-1];
+                    struct stat st;
+                    char child_full[PATH_MAX * 2];
+                    int w2 = snprintf(child_full, sizeof(child_full), "%s/%s", full, name);
+                    if (w2 < 0 || (size_t)w2 >= sizeof(child_full)) continue;
+                    if (lstat(child_full, &st) < 0) continue;
+                    if (S_ISLNK(st.st_mode)) continue;
+
+                    if (S_ISDIR(st.st_mode)) {
+                        char child_rel[PATH_MAX];
+                        int w1 = top->rel[0]
+                                 ? snprintf(child_rel, sizeof(child_rel), "%s/%s", top->rel, name)
+                                 : snprintf(child_rel, sizeof(child_rel), "%s", name);
+                        if (w1 < 0 || (size_t)w1 >= sizeof(child_rel)) continue;
+                        /* Push directory to stack (visited=0) */
+                        stack = realloc(stack, (stack_sz + 1) * sizeof(*stack));
+                        if (!stack) { while (names_count > 0) free(names[--names_count]); free(names); goto cleanup; }
+                        stack[stack_sz].rel = strdup(child_rel);
+                        stack[stack_sz].visited = 0;
+                        stack_sz++;
+                    }
+                }
+                for (size_t i = 0; i < names_count; i++) free(names[i]);
+                free(names);
+            }
+
+            /* top may be stale after realloc above – refresh it */
+            top = &stack[cur_idx];
+
+            /* Now mark current directory as visited and write its directory entry */
+            {
+                struct stat st;
+                if (lstat(full, &st) < 0) goto cleanup;
+                if (bundle_write_entry_header(w, top->rel[0] ? top->rel : ".", 1, 0,
+                                              st.st_mode & 0777, 0, 0) != 0)
+                    goto cleanup;
+            }
+            top->visited = 1;
+        } else {
+            /* Second visit – process all regular files in this directory (they have not been pushed) */
+            DIR *d = opendir(full);
+            if (!d) { perror("opendir"); goto cleanup; }
+
+            char **names = NULL;
+            size_t names_count = 0, names_cap = 0;
+            struct dirent *entry;
+            while ((entry = readdir(d)) != NULL) {
+                if (strcmp(entry->d_name, ".") == 0 ||
+                    strcmp(entry->d_name, "..") == 0) continue;
+                if (names_count >= names_cap) {
+                    names_cap = names_cap ? names_cap * 2 : 32;
+                    names = realloc(names, names_cap * sizeof(char *));
+                    if (!names) { closedir(d); goto cleanup; }
+                }
+                names[names_count] = strdup(entry->d_name);
+                if (!names[names_count]) { closedir(d); while (names_count > 0) free(names[--names_count]); free(names); goto cleanup; }
+                names_count++;
+            }
+            closedir(d);
+
+            if (names_count > 0) {
+                qsort(names, names_count, sizeof(char *), dirent_comp);
+                for (size_t i = 0; i < names_count; i++) {
+                    const char *name = names[i];
+                    struct stat st;
+                    char child_full[PATH_MAX * 2];
+                    int w2 = snprintf(child_full, sizeof(child_full), "%s/%s", full, name);
+                    if (w2 < 0 || (size_t)w2 >= sizeof(child_full)) continue;
+                    if (lstat(child_full, &st) < 0) continue;
+                    if (S_ISDIR(st.st_mode)) continue;  /* already processed */
+                    if (!S_ISREG(st.st_mode)) continue;
+
+                    char child_rel[PATH_MAX];
+                    int w1 = top->rel[0]
+                             ? snprintf(child_rel, sizeof(child_rel), "%s/%s", top->rel, name)
+                             : snprintf(child_rel, sizeof(child_rel), "%s", name);
+                    if (w1 < 0 || (size_t)w1 >= sizeof(child_rel)) continue;
+
+                    int fd = open(child_full, O_RDONLY);
+                    if (fd < 0) { perror("open"); continue; }
+                    if (bundle_write_entry_header(w, child_rel, 0, st.st_size,
+                                                  st.st_mode & 0777,
+                                                  st.st_mtim.tv_sec,
+                                                  st.st_mtim.tv_nsec) != 0) {
+                        close(fd);
+                        continue;
+                    }
+                    uint8_t *buf = malloc(CHUNK_SIZE);
+                    ssize_t n;
+                    while ((n = read_full(fd, buf, CHUNK_SIZE)) > 0) {
+                        if (g_interrupted) { free(buf); close(fd); break; }
+                        if (writer_push(w, buf, (size_t)n,
+                                        crypto_secretstream_xchacha20poly1305_TAG_MESSAGE) != 0) {
+                            free(buf); close(fd); goto cleanup;
+                        }
+                    }
+                    free(buf);
+                    close(fd);
+                    file_count++;
+                    if (g_interrupted) break;
+                }
+                for (size_t i = 0; i < names_count; i++) free(names[i]);
+                free(names);
+            }
+            /* Pop this directory from stack */
+            free(top->rel);
+            stack_sz--;
         }
-        if (g_interrupted) { errors++; break; }
     }
-    closedir(d);
-    return errors ? -1 : 0;
+
+    if (g_interrupted) goto cleanup;
+    ret = file_count;   /* return number of files bundled */
+
+cleanup:
+    while (stack_sz > 0) {
+        free(stack[stack_sz - 1].rel);
+        stack_sz--;
+    }
+    free(stack);
+    return ret;
 }
 
 static int encrypt_dir(const char *dirpath, const char *outpath,
                         const char *password, size_t pw_len,
                         const uint8_t *keyfile_data, size_t keyfile_len,
-                        uint64_t opslimit, uint64_t memlimit, int verbose) {
+                        uint64_t opslimit, uint64_t memlimit,
+                        int verbose, int force_overwrite) {
+    /* Overwrite guard */
+    if (!force_overwrite) {
+        struct stat st_out;
+        if (stat(outpath, &st_out) == 0) {
+            fprintf(stderr, "Output '%s' already exists. Use -f to force overwrite.\n", outpath);
+            return -1;
+        }
+    }
+
     int out_fd = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (out_fd < 0) { perror("open output"); return -1; }
-    g_output_path = outpath;
 
     uint8_t dek[DEK_SIZE];
     sv_header_t hdr; memset(&hdr, 0, sizeof(hdr));
@@ -770,99 +1048,149 @@ static int encrypt_dir(const char *dirpath, const char *outpath,
     }
 
     uint8_t kek[DEK_SIZE];
+    if (sodium_mlock(kek, DEK_SIZE) != 0) { close(out_fd); return -1; }
     if (derive_kek(password, pw_len, keyfile_data, keyfile_len, hdr.salt, kek,
                    opslimit, (size_t)memlimit) != 0) {
-        fprintf(stderr, "Key derivation failed\n"); close(out_fd); return -1;
+        fprintf(stderr, "Key derivation failed\n");
+        sodium_munlock(kek, DEK_SIZE);
+        close(out_fd); return -1;
     }
+    if (sodium_mlock(dek, DEK_SIZE) != 0) { sodium_munlock(kek, DEK_SIZE); close(out_fd); return -1; }
     randombytes_buf(dek, DEK_SIZE);
     randombytes_buf(hdr.wrap_nonce, WRAP_NONCE_SIZE);
     int wrap_rc = crypto_secretbox_easy(hdr.wrapped_dek, dek, DEK_SIZE,
                                         hdr.wrap_nonce, kek);
+    sodium_munlock(kek, DEK_SIZE);
     sodium_memzero(kek, DEK_SIZE);
-    if (wrap_rc != 0) { fprintf(stderr, "DEK wrap failed\n"); close(out_fd); return -1; }
+    if (wrap_rc != 0) {
+        fprintf(stderr, "DEK wrap failed\n");
+        sodium_munlock(dek, DEK_SIZE);
+        close(out_fd); return -1;
+    }
 
     sv_writer_t w; memset(&w, 0, sizeof(w));
     if (writer_init(&w, out_fd, dek, hdr.stream_header, (const uint8_t *)&hdr, sizeof(hdr)) != 0) {
-        fprintf(stderr, "Stream init failed\n"); close(out_fd); return -1;
+        fprintf(stderr, "Stream init failed\n");
+        sodium_munlock(dek, DEK_SIZE);
+        close(out_fd); return -1;
     }
 
     if (write_full(out_fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
-        perror("write header"); writer_free(&w); close(out_fd); return -1;
+        perror("write header");
+        writer_free(&w);
+        sodium_munlock(dek, DEK_SIZE);
+        close(out_fd); return -1;
     }
 
-    int file_count = 0;
-    int ret = bundle_add_tree(&w, dirpath, "", &file_count);
+    int file_count = bundle_add_tree(&w, dirpath);
+    if (file_count < 0) {
+        writer_free(&w);
+        sodium_munlock(dek, DEK_SIZE);
+        close(out_fd);
+        unlink(outpath);
+        return -1;
+    }
 
     /* Final empty TAG_FINAL block marks end of bundle. */
-    if (ret == 0) {
-        uint8_t end_marker[1] = { ENTRY_END };
-        if (writer_push(&w, end_marker, 1,
-                        crypto_secretstream_xchacha20poly1305_TAG_FINAL) != 0)
-            ret = -1;
+    uint8_t end_marker[1] = { ENTRY_END };
+    int ret = writer_push(&w, end_marker, 1,
+                          crypto_secretstream_xchacha20poly1305_TAG_FINAL);
+    if (ret != 0) {
+        writer_free(&w);
+        sodium_munlock(dek, DEK_SIZE);
+        close(out_fd);
+        unlink(outpath);
+        return -1;
     }
 
     if (verbose) fprintf(stderr, "Bundled %d files from %s -> %s\n",
                          file_count, dirpath, outpath);
 
+    sodium_munlock(dek, DEK_SIZE);
     sodium_memzero(dek, DEK_SIZE);
     writer_free(&w);
     close(out_fd);
-    if (ret != 0) unlink(outpath);
-    return ret;
+    return 0;
 }
 
 static int decrypt_dir_bundle(const char *inpath, const char *outdir,
                                const char *password, size_t pw_len,
                                const uint8_t *keyfile_data, size_t keyfile_len,
-                               int verify_only, int verbose) {
-    int in_fd = open(inpath, O_RDONLY);
-    if (in_fd < 0) { perror("open input"); return -1; }
+                               int verify_only, int verbose, int force_overwrite) {
+    int in_fd = -1, ret = -1, files_done = 0;
+    if (strcmp(inpath, "-") == 0) {
+        in_fd = STDIN_FILENO;
+    } else {
+        in_fd = open(inpath, O_RDONLY);
+        if (in_fd < 0) { perror("open input"); return -1; }
+    }
 
     sv_header_t hdr;
     if (read_full(in_fd, &hdr, sizeof(hdr)) != sizeof(hdr) ||
         memcmp(hdr.magic, SV_MAGIC, 4) != 0 || hdr.version != SV_VERSION) {
         fprintf(stderr, "Invalid or unsupported vault bundle\n");
-        close(in_fd); return -1;
+        goto cleanup_fd;
     }
 
     uint64_t opslimit = get_u64be(hdr.opslimit_be);
     uint64_t memlimit = get_u64be(hdr.memlimit_be);
 
     uint8_t dek[DEK_SIZE], kek[DEK_SIZE];
+    if (sodium_mlock(kek, DEK_SIZE) != 0) goto cleanup_fd;
     if (derive_kek(password, pw_len, keyfile_data, keyfile_len, hdr.salt, kek,
                    opslimit, (size_t)memlimit) != 0) {
-        fprintf(stderr, "Key derivation failed\n"); close(in_fd); return -1;
+        fprintf(stderr, "Key derivation failed\n");
+        sodium_munlock(kek, DEK_SIZE);
+        goto cleanup_fd;
     }
+    if (sodium_mlock(dek, DEK_SIZE) != 0) { sodium_munlock(kek, DEK_SIZE); goto cleanup_fd; }
     int unwrap_rc = crypto_secretbox_open_easy(dek, hdr.wrapped_dek,
                                                 sizeof(hdr.wrapped_dek),
                                                 hdr.wrap_nonce, kek);
+    sodium_munlock(kek, DEK_SIZE);
     sodium_memzero(kek, DEK_SIZE);
     if (unwrap_rc != 0) {
         fprintf(stderr, "[FAIL] Wrong password/keyfile, or header tampered\n");
-        close(in_fd); return -1;
+        sodium_munlock(dek, DEK_SIZE);
+        goto cleanup_fd;
     }
 
     sv_reader_t r;
     if (reader_init(&r, in_fd, dek, hdr.stream_header, (const uint8_t *)&hdr, sizeof(hdr)) != 0) {
-        fprintf(stderr, "Stream init failed\n"); close(in_fd); return -1;
+        fprintf(stderr, "Stream init failed\n");
+        sodium_munlock(dek, DEK_SIZE);
+        goto cleanup_fd;
     }
 
     char staging[PATH_MAX * 2] = {0};
     if (!verify_only) {
+        /* Guard against existing output directory */
+        struct stat st_out;
+        if (stat(outdir, &st_out) == 0) {
+            if (!force_overwrite) {
+                fprintf(stderr, "Output directory '%s' already exists. Use -f to force overwrite.\n", outdir);
+                reader_free(&r);
+                sodium_munlock(dek, DEK_SIZE);
+                goto cleanup_fd;
+            }
+            recursive_remove(outdir);
+        }
         snprintf(staging, sizeof(staging), "%s.svtmp.XXXXXX", outdir);
         if (mkdtemp(staging) == NULL) {
             perror("mkdtemp staging");
             reader_free(&r);
-            close(in_fd);
-            return -1;
+            sodium_munlock(dek, DEK_SIZE);
+            goto cleanup_fd;
         }
     }
 
     uint8_t *plain = sodium_malloc(CHUNK_SIZE + crypto_secretstream_xchacha20poly1305_ABYTES);
-    int ret = -1, files_done = 0;
     int out_fd = -1;
     off_t remaining_in_file = 0;
     int in_file = 0;
+    uint32_t saved_mode = 0;
+    int64_t saved_msec = 0;
+    int32_t saved_mnsec = 0;
     char cur_path[PATH_MAX * 2] = {0};
 
     for (;;) {
@@ -882,9 +1210,14 @@ static int decrypt_dir_bundle(const char *inpath, const char *outdir,
                 if (tag == crypto_secretstream_xchacha20poly1305_TAG_FINAL) break;
                 continue;
             }
-            if (plain[0] != ENTRY_FILE || plen < 1 + 2) goto cleanup;
+            if (plain[0] != ENTRY_FILE && plain[0] != ENTRY_DIR) goto cleanup;
+            if (plen < 1 + 2) goto cleanup;
             uint16_t path_len = ((uint16_t)plain[1] << 8) | plain[2];
-            if (plen < (size_t)(1 + 2 + path_len + 8 + 4)) goto cleanup;
+            /* Minimum length for files: tag(1)+pathlen(2)+path+size(8)+mode(4)+mtime(12) = 27+path */
+            /* Minimum length for dirs:  tag(1)+pathlen(2)+path+mode(4) = 7+path */
+            if (plain[0] == ENTRY_FILE && plen < (size_t)(1 + 2 + path_len + 8 + 4 + 8 + 4)) goto cleanup;
+            if (plain[0] == ENTRY_DIR  && plen < (size_t)(1 + 2 + path_len + 4)) goto cleanup;
+
             char relpath[PATH_MAX];
             if (path_len >= sizeof(relpath)) goto cleanup;
             memcpy(relpath, plain + 3, path_len);
@@ -893,9 +1226,49 @@ static int decrypt_dir_bundle(const char *inpath, const char *outdir,
                 fprintf(stderr, "Refusing unsafe path in bundle: %s\n", relpath);
                 goto cleanup;
             }
+
+            if (plain[0] == ENTRY_DIR) {
+                if (verify_only) {
+                    files_done++;
+                    continue;
+                }
+                int wrote = snprintf(cur_path, sizeof(cur_path), "%s/%s", staging, relpath);
+                if (wrote < 0 || (size_t)wrote >= sizeof(cur_path)) {
+                    fprintf(stderr, "Output path too long for directory: %s\n", relpath);
+                    goto cleanup;
+                }
+                /* mkdir -p equivalent */
+                char tmp[PATH_MAX * 2];
+                strncpy(tmp, cur_path, sizeof(tmp)-1);
+                tmp[sizeof(tmp)-1] = '\0';
+                for (char *p = tmp + strlen(staging) + 1; *p; p++) {
+                    if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+                }
+                if (mkdir(cur_path, 0755) != 0 && errno != EEXIST) {
+                    perror("mkdir"); goto cleanup;
+                }
+                /* Restore mode */
+                uint32_t mode = ((uint32_t)plain[3 + path_len] << 24) |
+                                ((uint32_t)plain[3 + path_len + 1] << 16) |
+                                ((uint32_t)plain[3 + path_len + 2] << 8) |
+                                (uint32_t)plain[3 + path_len + 3];
+                if (chmod(cur_path, mode) != 0) {
+                    perror("chmod dir"); /* non-fatal */
+                }
+                files_done++;
+                continue;
+            }
+
+            /* ENTRY_FILE */
             uint64_t fsize = get_u64be(plain + 3 + path_len);
             remaining_in_file = (off_t)fsize;
             in_file = 1;
+            saved_mode = ((uint32_t)plain[3 + path_len + 8] << 24) |
+                         ((uint32_t)plain[3 + path_len + 8 + 1] << 16) |
+                         ((uint32_t)plain[3 + path_len + 8 + 2] << 8) |
+                         (uint32_t)plain[3 + path_len + 8 + 3];
+            saved_msec = (int64_t)get_u64be(plain + 3 + path_len + 12);
+            saved_mnsec = get_i32be(plain + 3 + path_len + 20);
 
             if (verify_only) {
                 files_done++;
@@ -907,7 +1280,7 @@ static int decrypt_dir_bundle(const char *inpath, const char *outdir,
                     fprintf(stderr, "Output path too long, skipping: %s\n", relpath);
                     goto cleanup;
                 }
-                /* mkdir -p equivalent */
+                /* mkdir -p for parent */
                 char tmp[PATH_MAX * 2];
                 strncpy(tmp, cur_path, sizeof(tmp)-1);
                 tmp[sizeof(tmp)-1] = '\0';
@@ -916,7 +1289,13 @@ static int decrypt_dir_bundle(const char *inpath, const char *outdir,
                 }
                 out_fd = open(cur_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
                 if (out_fd < 0) { perror("open output entry"); goto cleanup; }
-                if (remaining_in_file == 0) { close(out_fd); out_fd = -1; in_file = 0; files_done++; }
+                if (remaining_in_file == 0) {
+                    close(out_fd); out_fd = -1;
+                    fchmodat(AT_FDCWD, cur_path, saved_mode, 0);
+                    struct timespec times[2] = { {0, UTIME_OMIT}, {saved_msec, saved_mnsec} };
+                    utimensat(AT_FDCWD, cur_path, times, 0);
+                    in_file = 0; files_done++;
+                }
             }
         } else {
             size_t to_write = plen;
@@ -928,7 +1307,13 @@ static int decrypt_dir_bundle(const char *inpath, const char *outdir,
             }
             remaining_in_file -= to_write;
             if (remaining_in_file == 0) {
-                if (!verify_only && out_fd >= 0) { close(out_fd); out_fd = -1; }
+                if (!verify_only && out_fd >= 0) {
+                    close(out_fd);
+                    out_fd = -1;
+                    fchmodat(AT_FDCWD, cur_path, saved_mode, 0);
+                    struct timespec times[2] = { {0, UTIME_OMIT}, {saved_msec, saved_mnsec} };
+                    utimensat(AT_FDCWD, cur_path, times, 0);
+                }
                 in_file = 0;
                 files_done++;
             }
@@ -942,9 +1327,12 @@ static int decrypt_dir_bundle(const char *inpath, const char *outdir,
 cleanup:
     if (out_fd >= 0) close(out_fd);
     if (plain) sodium_free(plain);
+    sodium_munlock(dek, DEK_SIZE);
     sodium_memzero(dek, DEK_SIZE);
     reader_free(&r);
-    close(in_fd);
+
+cleanup_fd:
+    if (in_fd >= 0 && in_fd != STDIN_FILENO) close(in_fd);
 
     if (verify_only) {
         if (verbose) fprintf(stderr, "%s %d files OK\n",
@@ -971,19 +1359,23 @@ cleanup:
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "ShadowVault v6 - Envelope + XChaCha20-Poly1305 Secretstream\n\n"
+        "ShadowVault v6.1 – Envelope + XChaCha20-Poly1305 Secretstream\n\n"
         "Usage:\n"
         "  %s enc <file|dir>   [options]\n"
         "  %s dec <vault>      [options]\n"
         "  %s verify <vault>   [options]\n\n"
         "Options:\n"
-        "  -p, --password <pw>   Password (\"-\" to prompt)\n"
-        "  -k, --keyfile <file>  Key file, combined with password\n"
-        "  -o, --output <path>   Output path\n"
-        "  -c, --compress        Enable zlib compression (file mode only; persisted)\n"
-        "  -s, --shred           Securely overwrite + delete original after encrypting\n"
-        "  -v, --verbose         Verbose output\n"
-        "  -h, --help            This help\n\n"
+        "  -p, --password <pw>       Password (\"-\" to prompt)\n"
+        "  -k, --keyfile <file>      Key file, combined with password\n"
+        "  -o, --output <path>       Output path (\"-\" for stdout)\n"
+        "  -c, --compress            Enable zlib compression (file mode only; persisted)\n"
+        "  -s, --shred               Securely overwrite + delete original after encrypting\n"
+        "  -f, --force               Force overwrite of existing output\n"
+        "  -t, --opslimit <n>        Argon2id opslimit (encrypt only)\n"
+        "  -m, --memlimit <n>        Argon2id memlimit in bytes (encrypt only)\n"
+        "  -v, --verbose             Verbose output\n"
+        "  -h, --help                This help\n"
+        "      --keyfile-max-size <n>  Max keyfile size (default 4 MiB)\n\n"
         "Argon2id cost is stored in the file header – no need to repeat at decrypt.\n"
         "Directory mode bundles the whole tree into one authenticated stream.\n",
         prog, prog, prog);
@@ -998,29 +1390,40 @@ int main(int argc, char **argv) {
     const char *action = NULL, *target = NULL;
     char *password = NULL;
     const char *keyfile_path = NULL, *output = NULL;
-    int compress = 0, verbose = 0, shred = 0, verify_only = 0;
+    int compress = 0, verbose = 0, shred = 0, verify_only = 0, force_overwrite = 0;
+    uint64_t opslimit = DEFAULT_OPSLIMIT;
+    uint64_t memlimit = DEFAULT_MEMLIMIT;
+    size_t keyfile_max_size = DEFAULT_KEYFILE_MAX_SIZE;
 
     static struct option long_opts[] = {
-        {"password", required_argument, 0, 'p'},
-        {"keyfile",  required_argument, 0, 'k'},
-        {"output",   required_argument, 0, 'o'},
-        {"compress", no_argument,       0, 'c'},
-        {"shred",    no_argument,       0, 's'},
-        {"verbose",  no_argument,       0, 'v'},
-        {"help",     no_argument,       0, 'h'},
+        {"password",   required_argument, 0, 'p'},
+        {"keyfile",    required_argument, 0, 'k'},
+        {"output",     required_argument, 0, 'o'},
+        {"compress",   no_argument,       0, 'c'},
+        {"shred",      no_argument,       0, 's'},
+        {"force",      no_argument,       0, 'f'},
+        {"opslimit",   required_argument, 0, 't'},
+        {"memlimit",   required_argument, 0, 'm'},
+        {"verbose",    no_argument,       0, 'v'},
+        {"help",       no_argument,       0, 'h'},
+        {"keyfile-max-size", required_argument, 0, 1000},   /* long-only */
         {0,0,0,0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:k:o:csvh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:k:o:csft:m:vh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': password = optarg; break;
         case 'k': keyfile_path = optarg; break;
         case 'o': output = optarg; break;
         case 'c': compress = 1; break;
         case 's': shred = 1; break;
+        case 'f': force_overwrite = 1; break;
+        case 't': opslimit = strtoull(optarg, NULL, 10); break;
+        case 'm': memlimit = strtoull(optarg, NULL, 10); break;
         case 'v': verbose = 1; break;
         case 'h': usage(argv[0]); return 0;
+        case 1000: keyfile_max_size = strtoull(optarg, NULL, 10); break;
         default: usage(argv[0]); return 1;
         }
     }
@@ -1050,6 +1453,8 @@ int main(int argc, char **argv) {
         password = pw_buf;
     }
     size_t pw_len = strlen(password);
+    /* Lock password buffer */
+    sodium_mlock(pw_buf, sizeof(pw_buf));
 
     uint8_t *keyfile_data = NULL;
     size_t keyfile_len = 0;
@@ -1057,16 +1462,19 @@ int main(int argc, char **argv) {
         FILE *kf = fopen(keyfile_path, "rb");
         if (!kf) { perror("keyfile open"); return 1; }
         struct stat kst;
-        if (fstat(fileno(kf), &kst) < 0 || kst.st_size > 1024 * 1024) {
-            fprintf(stderr, "Keyfile invalid or too large (max 1 MiB)\n");
+        if (fstat(fileno(kf), &kst) < 0 || (size_t)kst.st_size > keyfile_max_size) {
+            fprintf(stderr, "Keyfile invalid or too large (max %zu bytes)\n", keyfile_max_size);
             fclose(kf); return 1;
         }
         keyfile_len = (size_t)kst.st_size;
         keyfile_data = sodium_malloc(keyfile_len > 0 ? keyfile_len : 1);
+        if (!keyfile_data) { fclose(kf); return 1; }
+        sodium_mlock(keyfile_data, keyfile_len > 0 ? keyfile_len : 1);
         rewind(kf);
-        if (!keyfile_data || fread(keyfile_data, 1, keyfile_len, kf) != keyfile_len) {
+        if (fread(keyfile_data, 1, keyfile_len, kf) != keyfile_len) {
             fclose(kf);
-            if (keyfile_data) sodium_free(keyfile_data);
+            sodium_munlock(keyfile_data, keyfile_len);
+            sodium_free(keyfile_data);
             return 1;
         }
         fclose(kf);
@@ -1075,30 +1483,33 @@ int main(int argc, char **argv) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
-    sa.sa_flags = SA_RESTART; /* Restart interrupted syscalls */
+    sa.sa_flags = SA_RESTART;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    int ret = 1;
+
+    /* For non-stdin targets, resolve real path for safety checks */
     struct stat st;
-    if (stat(target, &st) < 0) {
+    int use_stdin = (strcmp(target, "-") == 0);
+    if (!use_stdin && stat(target, &st) < 0) {
         perror("stat target");
-        if (keyfile_data) sodium_free(keyfile_data);
-        return 1;
+        goto exit_mem;
     }
 
-    char target_real[PATH_MAX];
-    if (realpath(target, target_real) == NULL) {
-        perror("realpath target");
-        if (keyfile_data) sodium_free(keyfile_data);
-        return 1;
+    char target_real[PATH_MAX] = {0};
+    if (!use_stdin) {
+        if (realpath(target, target_real) == NULL) {
+            perror("realpath target");
+            goto exit_mem;
+        }
     }
 
-    char output_real[PATH_MAX] = {0};
+    char output_real[PATH_MAX * 2] = {0};
     char default_out[PATH_MAX];
-    int ret;
 
     if (strcmp(action, "enc") == 0) {
-        if (S_ISDIR(st.st_mode)) {
+        if (!use_stdin && S_ISDIR(st.st_mode)) {
             if (!output) {
                 snprintf(default_out, sizeof(default_out), "%s.vault", target);
                 output = default_out;
@@ -1113,17 +1524,17 @@ int main(int argc, char **argv) {
                     snprintf(output_real, sizeof(output_real), "%s/%s",
                              dir_real, basename((char *)output));
                 } else {
-                    strncpy(output_real, output, sizeof(output_real)-1);
+                    output_real[0] = '\0';
+                    strncat(output_real, output, sizeof(output_real) - 1);
                 }
             }
             if (is_path_inside(target_real, output_real)) {
                 fprintf(stderr, "Error: output vault must not be inside the input directory\n");
-                if (keyfile_data) sodium_free(keyfile_data);
-                return 1;
+                goto exit_mem;
             }
             ret = encrypt_dir(target, output, password, pw_len,
                               keyfile_data, keyfile_len,
-                              DEFAULT_OPSLIMIT, DEFAULT_MEMLIMIT, verbose);
+                              opslimit, memlimit, verbose, force_overwrite);
         } else {
             if (!output) {
                 snprintf(default_out, sizeof(default_out), "%s.vault", target);
@@ -1131,13 +1542,13 @@ int main(int argc, char **argv) {
             }
             ret = encrypt_file(target, output, password, pw_len,
                                keyfile_data, keyfile_len,
-                               compress, DEFAULT_OPSLIMIT, DEFAULT_MEMLIMIT,
-                               shred, verbose);
+                               compress, opslimit, memlimit,
+                               shred, verbose, force_overwrite);
         }
     } else if (strcmp(action, "dec") == 0 || strcmp(action, "verify") == 0) {
         verify_only = (strcmp(action, "verify") == 0);
         int is_bundle = 0;
-        {
+        if (!use_stdin) {
             FILE *f = fopen(target, "rb");
             if (f) {
                 sv_header_t peek;
@@ -1147,6 +1558,9 @@ int main(int argc, char **argv) {
                 }
                 fclose(f);
             }
+        } else {
+            /* Cannot peek stdin; assume single file */
+            is_bundle = 0;
         }
         if (is_bundle) {
             if (!output && !verify_only) {
@@ -1156,7 +1570,7 @@ int main(int argc, char **argv) {
             ret = decrypt_dir_bundle(target, verify_only ? NULL : output,
                                      password, pw_len,
                                      keyfile_data, keyfile_len,
-                                     verify_only, verbose);
+                                     verify_only, verbose, force_overwrite);
         } else {
             if (!output && !verify_only) {
                 size_t len = strlen(target);
@@ -1173,7 +1587,7 @@ int main(int argc, char **argv) {
             ret = decrypt_file(target, verify_only ? NULL : output,
                                password, pw_len,
                                keyfile_data, keyfile_len,
-                               verify_only, verbose);
+                               verify_only, verbose, force_overwrite);
         }
     } else {
         fprintf(stderr, "Unknown action: %s\n", action);
@@ -1181,10 +1595,15 @@ int main(int argc, char **argv) {
         ret = 1;
     }
 
-    /* Fix: securely zero the entire password buffer, not just strlen */
-    explicit_bzero(pw_buf, sizeof(pw_buf));
-    if (keyfile_data) { sodium_memzero(keyfile_data, keyfile_len); sodium_free(keyfile_data); }
-
     fprintf(stderr, ret == 0 ? "[+] Success\n" : "[-] Operation failed\n");
+
+exit_mem:
+    sodium_munlock(pw_buf, sizeof(pw_buf));
+    sodium_memzero(pw_buf, sizeof(pw_buf));
+    if (keyfile_data) {
+        sodium_munlock(keyfile_data, keyfile_len);
+        sodium_memzero(keyfile_data, keyfile_len);
+        sodium_free(keyfile_data);
+    }
     return ret;
 }
