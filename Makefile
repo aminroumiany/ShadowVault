@@ -1,4 +1,4 @@
-CC      = cc
+CC      = /home/kali/gcc-outlaws/bin/outlaws-gcc
 CFLAGS  = -O2 -Wall -Wextra -Wpedantic
 LDFLAGS = -lsodium -lz
 
