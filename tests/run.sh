@@ -33,6 +33,11 @@ build_asan() {
 [ "${SV_ASAN:-0}" = "1" ] && { build_asan || { echo "asan build failed"; exit 1; }; }
 [ -x "$BIN" ] || $CC -O2 -Wall -Wextra -o "$BIN" "$ROOT/shadowvault.c" -lsodium -lz
 [ -x "$BIN" ] || { echo "no binary at $BIN"; exit 1; }
+# rebuild when the default binary is older than the source
+if [ -z "${SV:-}" ] && [ -x "$BIN" ] && [ "$ROOT/shadowvault.c" -nt "$BIN" ]; then
+    echo "== source newer than binary; rebuilding =="
+    $CC -O2 -Wall -Wextra -o "$BIN" "$ROOT/shadowvault.c" -lsodium -lz || { echo "rebuild failed"; exit 1; }
+fi
 
 sv()  { "$BIN" "$@"; }
 enc() { sv enc "$@"; }          # password via stdin by caller
@@ -297,6 +302,138 @@ sv rekey v6.vault -p v6fixpass >/dev/null 2>&1;            chk $? "rekey migrate
 echo -n v6fixpass | sv verify v6.v7.vault >/dev/null 2>&1; chk $? "migrated vault verifies"
 printf 'extra\n' | sv addkey v6.v7.vault -p v6fixpass >/dev/null 2>&1; chk $? "slots work on migrated vault"
 sv list v6.v7.vault -p v6fixpass >/dev/null 2>&1;          chk $? "list works on migrated vault"
+
+############################################
+section "single-file metadata restore"
+############################################
+rm -f md.bin md.vault md.out
+head -c 5000 /dev/urandom > md.bin
+chmod 640 md.bin
+touch -d '2023-08-09 12:34:56' md.bin
+echo -n pw | enc md.bin -o md.vault 2>/dev/null
+dec md.vault -p pw -o md.out 2>/dev/null;                  chk $? "dec runs"
+[ "$(stat -c%a md.out)" = "640" ];                         chk $? "dec restores mode"
+[ "$(stat -c%Y md.out)" = "$(stat -c%Y md.bin)" ];         chk $? "dec restores mtime"
+rm -f si.vault si.out
+sv enc - -o si.vault -p pw < md.bin 2>/dev/null
+dec si.vault -p pw -o si.out 2>/dev/null && cmp -s md.bin si.out
+                                                           chk $? "stdin vault roundtrip (no metadata restore)"
+
+############################################
+section "read-only directory extraction"
+############################################
+rm -rf ro ro.vault ro_out
+mkdir -p ro/sub
+echo data > ro/rofile.txt
+echo deep > ro/sub/deep.txt
+chmod 555 ro; chmod 555 ro/sub; chmod 644 ro/rofile.txt
+echo -n pw | enc ro 2>/dev/null;                           chk $? "enc dir with read-only dirs"
+dec ro.vault -p pw -o ro_out 2>/dev/null;                  chk $? "dec with read-only dir modes"
+[ "$(stat -c%a ro_out)" = "555" ] && [ "$(cat ro_out/rofile.txt)" = "data" ] \
+  && [ "$(stat -c%a ro_out/sub)" = "555" ] && [ "$(cat ro_out/sub/deep.txt)" = "deep" ]
+                                                           chk $? "read-only dir modes + contents restored"
+chmod -R u+w ro
+
+############################################
+section "atomic outputs & -f safety"
+############################################
+rm -f at.bin at.vault at.out at_bad.vault
+head -c 10000 /dev/urandom > at.bin
+echo -n pw | enc at.bin -o at.vault 2>/dev/null
+echo OLDDATA > at.out
+cp at.vault at_bad.vault; printf X | dd of=at_bad.vault bs=1 seek=1000 conv=notrunc 2>/dev/null
+dec at_bad.vault -p pw -f -o at.out 2>/dev/null;           [ $? -ne 0 ]; chk $? "dec -f of tampered vault fails"
+[ "$(cat at.out)" = "OLDDATA" ];                           chk $? "failed dec -f keeps old output"
+echo -n pw | dec at.vault -f -o at.out 2>/dev/null;        chk $? "successful dec -f replaces output"
+cmp -s at.bin at.out;                                      chk $? "replaced output is correct"
+ls at.out.svtmp.* >/dev/null 2>&1;                         [ $? -ne 0 ]; chk $? "no temp files left behind"
+rm -rf btree btree.vault btree_out bb.vault
+mkdir btree; echo v1 > btree/f.txt
+echo -n pw | enc btree 2>/dev/null
+dec btree.vault -p pw -o btree_out 2>/dev/null;            chk $? "bundle dec"
+echo OLD > btree_out/f.txt
+cp btree.vault bb.vault; printf Y | dd of=bb.vault bs=1 seek=900 conv=notrunc 2>/dev/null
+cmp -s btree.vault bb.vault;                               [ $? -ne 0 ]; chk $? "bundle tamper applied"
+dec bb.vault -p pw -f -o btree_out 2>/dev/null;            [ $? -ne 0 ]; chk $? "bundle dec -f tamper fails"
+[ "$(cat btree_out/f.txt)" = "OLD" ];                      chk $? "failed bundle dec -f keeps old tree"
+dec btree.vault -p pw -f -o btree_out 2>/dev/null;         chk $? "successful bundle dec -f replaces"
+[ "$(cat btree_out/f.txt)" = "v1" ];                       chk $? "replaced bundle tree correct"
+
+############################################
+section "rekey metadata preservation"
+############################################
+rm -f rk.bin rk.vault rk.v7.vault rk_dec
+head -c 300000 /dev/urandom | base64 > rk.bin
+chmod 640 rk.bin; touch -d '2021-01-02 03:04:05' rk.bin
+echo -n pw | enc rk.bin -c -o rk.vault 2>/dev/null
+sv rekey rk.vault -p pw 2>/dev/null;                       chk $? "rekey runs"
+[ "$(head -c4 rk.v7.vault)" = "SV07" ];                    chk $? "rekey output is v7"
+[ "$(dd if=rk.v7.vault bs=1 skip=5 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')" = "1" ]
+                                                           chk $? "rekey preserves compress flag"
+out=$(sv list rk.v7.vault -p pw 2>/dev/null)
+echo "$out" | grep -q "rk.bin";                            chk $? "rekey keeps original filename"
+[ "$(echo "$out" | awk '/^f /{print $2}')" = "$(stat -c%s rk.bin)" ]
+                                                           chk $? "rekey keeps true size"
+echo "$out" | grep -q "2021-01-02";                        chk $? "rekey keeps mtime"
+echo -n pw | dec rk.v7.vault -o rk_dec -f 2>/dev/null
+cmp -s rk.bin rk_dec;                                      chk $? "rekey data intact"
+
+############################################
+section "stdin needs explicit password"
+############################################
+head -c 100 /dev/urandom > np.bin
+cat np.bin | sv enc - -o /dev/null 2>/dev/null;            [ $? -ne 0 ]; chk $? "stdin enc without -p rejected"
+cat np.bin | sv dec - -o /dev/null 2>/dev/null;            [ $? -ne 0 ]; chk $? "stdin dec without -p rejected"
+
+############################################
+section "password length handling"
+############################################
+LONGPW=$(printf 'x%.0s' $(seq 1 300))
+rm -f lp.bin lp.vault lp.out lp2.vault
+head -c 100 /dev/urandom > lp.bin
+echo -n "$LONGPW" | enc lp.bin -o lp.vault 2>/dev/null;    chk $? "300-byte password enc"
+echo -n "$LONGPW" | dec lp.vault -o lp.out -f 2>/dev/null; chk $? "300-byte password dec"
+cmp -s lp.bin lp.out;                                      chk $? "long password roundtrip"
+BIGPW=$(printf 'y%.0s' $(seq 1 5000))
+echo -n "$BIGPW" | enc lp.bin -o lp2.vault -f 2>/dev/null; [ $? -ne 0 ]; chk $? "overlong password rejected"
+
+############################################
+section "slots subcommand"
+############################################
+rm -f sl2.bin sl2.vault
+head -c 1000 /dev/urandom > sl2.bin
+echo -n pw0 | enc sl2.bin -o sl2.vault 2>/dev/null
+printf 'pw1\n' | sv addkey sl2.vault -p pw0 >/dev/null 2>&1
+out=$(sv slots sl2.vault 2>/dev/null)
+echo "$out" | grep -q "passphrase";                        chk $? "slots lists without password"
+[ "$(echo "$out" | grep -c passphrase)" = "2" ];           chk $? "slots shows both slots"
+sv slots sl2.vault -p pw1 2>/dev/null | grep -q "matches slot 1"
+                                                           chk $? "slots matches a credential"
+sv slots sl2.vault -p nope >/dev/null 2>&1;                [ $? -ne 0 ]; chk $? "slots wrong credential fails"
+
+############################################
+section "per-slot KDF params (type-2 slots)"
+############################################
+rm -f ps2.bin ps2.vault ps2.out
+head -c 2000 /dev/urandom > ps2.bin
+echo -n pw0 | enc ps2.bin -o ps2.vault 2>/dev/null
+printf 'pws\n' | sv addkey ps2.vault -p pw0 -t 2 -m 8388608 >/dev/null 2>&1
+                                                           chk $? "addkey with per-slot params"
+sv slots ps2.vault 2>/dev/null | grep -q "ops=2, mem=8192 KiB"
+                                                           chk $? "slots shows per-slot params"
+sv verify ps2.vault -p pws >/dev/null 2>&1;                chk $? "per-slot credential verifies"
+sv verify ps2.vault -p pw0 >/dev/null 2>&1;                chk $? "global credential still works"
+echo -n pws | sv dec ps2.vault -f -o ps2.out 2>/dev/null && cmp -s ps2.bin ps2.out
+                                                           chk $? "per-slot decrypt works"
+printf 'pwr\n' | sv passwd ps2.vault -p pws -t 4 -m 8388608 >/dev/null 2>&1
+                                                           chk $? "passwd with per-slot params"
+sv verify ps2.vault -p pwr >/dev/null 2>&1;                chk $? "rotated per-slot credential verifies"
+
+############################################
+section "version flag"
+############################################
+sv -V 2>/dev/null | grep -q "v7";                          chk $? "-V prints version"
+sv --version 2>/dev/null | grep -q "v7";                   chk $? "--version works"
 
 ############################################
 section "ASan subset"

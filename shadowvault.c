@@ -1,8 +1,11 @@
 /*
- * ShadowVault v6.1 – Envelope Encryption + XChaCha20-Poly1305 Secretstream
+ * ShadowVault v7 – multi-slot envelope encryption + XChaCha20-Poly1305
+ * secretstream.  Reads and writes the "SV07" wire format (see FORMAT.md);
+ * legacy "SV06" vaults are read-only (use `rekey` to migrate).
  *
  * Build: gcc -O2 -Wall -Wextra -o shadowvault shadowvault.c -lsodium -lz
- * Usage: ./shadowvault <enc|dec|verify> <file|dir> [options]
+ * Usage: ./shadowvault <enc|dec|verify|list|slots|keygen|addkey|passwd|
+ *                       delkey|rekey> <target> [options]
  *
  * ==========================================================================
  * WHAT CHANGED FROM v6.0 (improvements & hardening) @aminroumiany
@@ -149,8 +152,13 @@ typedef struct {
 #define SV7_HDR_LEN   (SV7_FIXED_LEN + SV7_MAX_SLOTS * SV7_SLOT_SIZE)
 
 /* slot types */
-#define SV_SLOT_EMPTY 0
-#define SV_SLOT_PASS  1
+#define SV_SLOT_EMPTY       0
+#define SV_SLOT_PASS        1   /* uses the header's global KDF params */
+/* Type 2 = passphrase with per-slot KDF params, encoded in the 7 reserved
+ * bytes: reserved[0]=1 marker, reserved[1..2]=opslimit u16 BE,
+ * reserved[3..6]=memlimit in KiB, u32 BE. Older readers skip type != 1. */
+#define SV_SLOT_PASS_PARAMS 2
+#define SV_SLOT_PARAMS_MARKER 1
 
 #pragma pack(push, 1)
 typedef struct {
@@ -361,6 +369,19 @@ static int vault_read_header(int fd, vault_meta_t *m) {
         m->aad      = m->raw;
         m->aad_len  = SV7_FIXED_LEN;
     }
+    /* Reject implausible KDF params up front and flag very memory-hungry
+     * ones: a tampered header could otherwise force a huge Argon2id
+     * allocation on whoever tries to unlock the vault. */
+    if (m->opslimit > crypto_pwhash_OPSLIMIT_MAX ||
+        m->memlimit > crypto_pwhash_MEMLIMIT_MAX) {
+        fprintf(stderr, "Error: implausible KDF params in header "
+                        "(ops=%llu mem=%llu) – header corrupt or hostile\n",
+                (unsigned long long)m->opslimit, (unsigned long long)m->memlimit);
+        return -1;
+    }
+    if (m->memlimit > (1ull << 30))
+        fprintf(stderr, "Warning: vault requests %llu MiB of Argon2id memory\n",
+                (unsigned long long)(m->memlimit >> 20));
     return 0;
 }
 
@@ -387,9 +408,26 @@ static int vault_unlock_ex(vault_meta_t *m, const char *pw, size_t pw_len,
     } else {
         for (unsigned i = 0; i < SV7_MAX_SLOTS && rc != 0; i++) {
             const uint8_t *slot = m->raw + SV7_FIXED_LEN + i * SV7_SLOT_SIZE;
-            if (slot[0] != SV_SLOT_PASS) continue;
+            uint64_t sops = m->opslimit;
+            uint64_t smem = m->memlimit;
+            if (slot[0] == SV_SLOT_PASS) {
+                /* global KDF params */
+            } else if (slot[0] == SV_SLOT_PASS_PARAMS &&
+                       slot[1] == SV_SLOT_PARAMS_MARKER) {
+                uint32_t ops16 = ((uint32_t)slot[2] << 8) | slot[3];
+                uint32_t kib   = ((uint32_t)slot[4] << 24) |
+                                 ((uint32_t)slot[5] << 16) |
+                                 ((uint32_t)slot[6] << 8)  | slot[7];
+                sops = ops16;
+                smem = (uint64_t)kib * 1024;
+                if (sops > crypto_pwhash_OPSLIMIT_MAX ||
+                    smem > crypto_pwhash_MEMLIMIT_MAX)
+                    continue;
+            } else {
+                continue;
+            }
             if (derive_kek(pw, pw_len, kf, kf_len, slot + 8, kek,
-                           m->opslimit, (size_t)m->memlimit) == 0 &&
+                           sops, (size_t)smem) == 0 &&
                 crypto_secretbox_open_easy(m->dek, slot + 48,
                                            DEK_SIZE + WRAP_MAC_SIZE,
                                            slot + 24, kek) == 0) {
@@ -409,13 +447,31 @@ static void vault_wipe_dek(vault_meta_t *m) {
     sodium_memzero(m->dek, DEK_SIZE);
 }
 
-/* Populate a passphrase slot wrapping `dek`. Returns 0 on success. */
-static int fill_slot(sv7_slot_t *slot, const uint8_t dek[DEK_SIZE],
-                     const char *pw, size_t pw_len,
-                     const uint8_t *kf, size_t kf_len,
-                     uint64_t ops, size_t mem) {
+/* Populate a passphrase slot wrapping `dek`. With `custom`, ops/mem are
+ * stored per-slot (type 2) instead of using the header's global params.
+ * Returns 0 on success. */
+static int fill_slot_ex(sv7_slot_t *slot, const uint8_t dek[DEK_SIZE],
+                        const char *pw, size_t pw_len,
+                        const uint8_t *kf, size_t kf_len,
+                        uint64_t ops, size_t mem, int custom) {
     memset(slot, 0, sizeof(*slot));
-    slot->type = SV_SLOT_PASS;
+    if (custom) {
+        if (ops < 1 || ops > 0xFFFF ||
+            mem < 1024 || (mem % 1024) != 0 ||
+            (uint64_t)(mem / 1024) > 0xFFFFFFFFull)
+            return -1;
+        uint32_t kib = (uint32_t)(mem / 1024);
+        slot->type = SV_SLOT_PASS_PARAMS;
+        slot->reserved[0] = SV_SLOT_PARAMS_MARKER;
+        slot->reserved[1] = (uint8_t)(ops >> 8);
+        slot->reserved[2] = (uint8_t)(ops & 0xff);
+        slot->reserved[3] = (uint8_t)(kib >> 24);
+        slot->reserved[4] = (uint8_t)(kib >> 16);
+        slot->reserved[5] = (uint8_t)(kib >> 8);
+        slot->reserved[6] = (uint8_t)(kib & 0xff);
+    } else {
+        slot->type = SV_SLOT_PASS;
+    }
     randombytes_buf(slot->kdf_salt, SALT_SIZE);
     randombytes_buf(slot->wrap_nonce, WRAP_NONCE_SIZE);
     uint8_t kek[DEK_SIZE];
@@ -429,6 +485,13 @@ static int fill_slot(sv7_slot_t *slot, const uint8_t dek[DEK_SIZE],
         sodium_memzero(kek, DEK_SIZE);
     }
     return rc;
+}
+
+static int fill_slot(sv7_slot_t *slot, const uint8_t dek[DEK_SIZE],
+                     const char *pw, size_t pw_len,
+                     const uint8_t *kf, size_t kf_len,
+                     uint64_t ops, size_t mem) {
+    return fill_slot_ex(slot, dek, pw, pw_len, kf, kf_len, ops, mem, 0);
 }
 
 /* ----- nftw helpers to recursively remove a directory ----- */
@@ -450,6 +513,8 @@ static int is_same_file(const char *a, const char *b) {
 static int is_path_inside(const char *parent, const char *child) {
     size_t plen = strlen(parent);
     if (plen == 0) return 0;
+    if (plen == 1 && parent[0] == '/')
+        return strcmp(child, "/") != 0;   /* everything except "/" itself */
     if (strncmp(child, parent, plen) != 0) return 0;
     if (child[plen] == '/' || child[plen] == '\0') return 1;
     return 0;
@@ -755,6 +820,117 @@ static int write_manifest_trailer(int out_fd, const uint8_t dek[DEK_SIZE],
     return ret;
 }
 
+/* --------------------------------------------------------------------------
+ * Walk payload frames from the current file offset looking for the "SVM1"
+ * encrypted manifest trailer. Payload frames are skipped (lseek on regular
+ * files, read-and-discard on pipes) but NOT authenticated.
+ *
+ * Returns:
+ *   0  trailer found and authenticated (*pt_out malloc'd — caller must
+ *      sodium_memzero() + free(); *pt_len_out set)
+ *   1  clean EOF before any trailer (legacy vault without one)
+ *  -1  I/O error, corrupt frame length, or manifest authentication failure
+ *
+ * *walked_out (optional) receives the number of bytes consumed.
+ * -------------------------------------------------------------------------- */
+static int sv_read_manifest(int fd, vault_meta_t *vm, int seekable,
+                            uint8_t **pt_out, size_t *pt_len_out,
+                            off_t *walked_out) {
+    *pt_out = NULL;
+    *pt_len_out = 0;
+    if (walked_out) *walked_out = 0;
+
+    uint8_t *discard = NULL;
+    if (!seekable) {
+        discard = malloc(256 * 1024);
+        if (!discard) return -1;
+    }
+
+    int ret = -1;
+    uint8_t *pt = NULL;
+    off_t walked = 0;
+
+    for (;;) {
+        uint8_t len4[4];
+        ssize_t got = read_full(fd, len4, 4);
+        if (got == 0) { ret = 1; break; }          /* clean EOF, no trailer */
+        if (got != 4) break;                        /* truncated */
+        walked += 4;
+
+        if (memcmp(len4, SV_MANIFEST_MAGIC, 4) == 0) {
+            uint8_t ver1, nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+            uint8_t ml8[8];
+            if (read_full(fd, &ver1, 1) != 1 || ver1 != SV_MANIFEST_VERSION ||
+                read_full(fd, nonce, sizeof(nonce)) != (ssize_t)sizeof(nonce) ||
+                read_full(fd, ml8, sizeof(ml8)) != (ssize_t)sizeof(ml8))
+                break;
+            uint64_t mlen = get_u64be(ml8);
+            if (mlen < crypto_aead_xchacha20poly1305_ietf_ABYTES ||
+                mlen > SV_MANIFEST_MAX_CT)
+                break;
+            unsigned char mkey[crypto_kdf_KEYBYTES];
+            unsigned char *ct = malloc((size_t)mlen);
+            pt = malloc((size_t)mlen);
+            if (!ct || !pt ||
+                crypto_kdf_derive_from_key(mkey, sizeof(mkey), 1, "SVmanif1",
+                                           vm->dek) != 0 ||
+                read_full(fd, ct, (size_t)mlen) != (ssize_t)mlen) {
+                sodium_memzero(mkey, sizeof(mkey));
+                free(ct);
+                free(pt);
+                pt = NULL;
+                break;
+            }
+            walked += (off_t)mlen;
+            unsigned long long plen = 0;
+            int rc = crypto_aead_xchacha20poly1305_ietf_decrypt(
+                pt, &plen, NULL, ct, mlen, vm->aad, vm->aad_len, nonce, mkey);
+            sodium_memzero(mkey, sizeof(mkey));
+            sodium_memzero(ct, (size_t)mlen);
+            free(ct);
+            if (rc != 0) { free(pt); pt = NULL; break; }
+            *pt_out = pt;
+            *pt_len_out = (size_t)plen;
+            ret = 0;
+            break;
+        }
+
+        /* payload frame: skip it */
+        uint32_t clen = ((uint32_t)len4[0] << 24) | ((uint32_t)len4[1] << 16) |
+                        ((uint32_t)len4[2] << 8) | (uint32_t)len4[3];
+        if (clen < crypto_secretstream_xchacha20poly1305_ABYTES ||
+            clen > CHUNK_SIZE + crypto_secretstream_xchacha20poly1305_ABYTES)
+            break;                                  /* corrupt frame length */
+        if (seekable) {
+            if (lseek(fd, (off_t)clen, SEEK_CUR) < 0) break;
+        } else {
+            off_t left = (off_t)clen;
+            while (left > 0) {
+                size_t want = left > 256 * 1024 ? 256 * 1024 : (size_t)left;
+                ssize_t r = read_full(fd, discard, want);
+                if (r <= 0) { left = -1; break; }
+                left -= r;
+            }
+            if (left != 0) break;
+        }
+        walked += (off_t)clen;
+        progress_update(walked, -1);
+    }
+
+    free(discard);
+    if (walked_out) *walked_out = walked;
+    return ret;
+}
+
+/* Optional metadata override for a single-file vault's manifest (used by
+ * rekey to carry the original filename/mode/times across migration). */
+typedef struct {
+    const char *display_name;   /* NULL -> basename of inpath (or "-") */
+    uint32_t    mode;
+    int64_t     mtime_sec;
+    int32_t     mtime_nsec;
+} sv_meta_override;
+
 /* ==========================================================================
  * Single file encrypt / decrypt
  * ========================================================================== */
@@ -848,14 +1024,17 @@ static int encrypt_file(const char *inpath, const char *outpath,
                          const char *password, size_t pw_len,
                          const uint8_t *keyfile_data, size_t keyfile_len,
                          int compress, uint64_t opslimit, uint64_t memlimit,
-                         int shred_original, int verbose, int force_overwrite) {
+                         int shred_original, int verbose, int force_overwrite,
+                         const sv_meta_override *meta_override) {
     int in_fd = -1, out_fd = -1, ret = -1;
     uint8_t dek[DEK_SIZE];
     sv_writer_t w; memset(&w, 0, sizeof(w));
     int writer_ok = 0;
+    char out_tmpl[PATH_MAX] = {0};
+    int used_temp = 0;
 
     /* Guard against overwriting existing output */
-    if (!force_overwrite) {
+    if (!force_overwrite && strcmp(outpath, "-") != 0) {
         struct stat st_out;
         if (stat(outpath, &st_out) == 0) {
             fprintf(stderr, "Output '%s' already exists. Use -f to force overwrite.\n", outpath);
@@ -883,8 +1062,16 @@ static int encrypt_file(const char *inpath, const char *outpath,
     if (use_stdout) {
         out_fd = STDOUT_FILENO;
     } else {
-        out_fd = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (out_fd < 0) { perror("open output"); goto cleanup; }
+        /* Write to a sibling temp file and rename into place on success so
+         * a failed or interrupted run never destroys an existing output. */
+        int tw = snprintf(out_tmpl, sizeof(out_tmpl), "%s.svtmp.XXXXXX", outpath);
+        if (tw < 0 || tw >= (int)sizeof(out_tmpl)) {
+            fprintf(stderr, "Error: output path too long\n");
+            goto cleanup;
+        }
+        out_fd = mkstemp(out_tmpl);
+        if (out_fd < 0) { perror("open output temp"); goto cleanup; }
+        used_temp = 1;
     }
 
     sv7_header_t hdr;
@@ -937,15 +1124,24 @@ static int encrypt_file(const char *inpath, const char *outpath,
         mbuf_t mf = {0};
         char *name_copy = NULL;
         const char *disp = "-";
-        if (!use_stdin) {
+        uint32_t mmode = 0;
+        int64_t msec = 0;
+        int32_t mnsec = 0;
+        if (meta_override && meta_override->display_name) {
+            disp = meta_override->display_name;
+            mmode = meta_override->mode;
+            msec = meta_override->mtime_sec;
+            mnsec = meta_override->mtime_nsec;
+        } else if (!use_stdin) {
             name_copy = strdup(inpath);
             disp = name_copy ? basename(name_copy) : "?";
+            mmode = (uint32_t)(st.st_mode & 0777);
+            msec = (int64_t)st.st_mtim.tv_sec;
+            mnsec = st.st_mtim.tv_nsec;
         }
         uint8_t rec[1 + 2 + MAX_BUNDLE_PATH + 8 + 4 + 8 + 4];
         int rn = encode_entry_header(rec, sizeof(rec), disp, 0, processed,
-                                     use_stdin ? 0 : (int)(st.st_mode & 0777),
-                                     use_stdin ? 0 : (int64_t)st.st_mtim.tv_sec,
-                                     use_stdin ? 0 : st.st_mtim.tv_nsec);
+                                     mmode, msec, mnsec);
         free(name_copy);
         if (rn < 0 || mbuf_append(&mf, rec, (size_t)rn) != 0 ||
             write_manifest_trailer(out_fd, dek,
@@ -959,6 +1155,13 @@ static int encrypt_file(const char *inpath, const char *outpath,
      * original – otherwise a crash can lose both copies at once. */
     if (out_fd >= 0 && out_fd != STDOUT_FILENO && fsync(out_fd) != 0)
         perror("fsync vault");
+
+    if (used_temp) {
+        if (rename(out_tmpl, outpath) != 0) {
+            perror("rename output into place");
+            goto cleanup;
+        }
+    }
 
     ret = 0;
 
@@ -976,7 +1179,7 @@ cleanup:
     if (in_fd >= 0 && in_fd != STDIN_FILENO) close(in_fd);
     if (out_fd >= 0 && out_fd != STDOUT_FILENO) {
         close(out_fd);
-        if (ret != 0) unlink(outpath);
+        if (ret != 0 && used_temp) unlink(out_tmpl);
     }
     return ret;
 }
@@ -991,6 +1194,9 @@ static int decrypt_file(const char *inpath, const char *outpath,
     int reader_ok = 0;
     z_stream zstrm; memset(&zstrm, 0, sizeof(zstrm));
     int zlib_ok = 0;
+    uint8_t *outbuf = NULL;
+    char out_tmpl[PATH_MAX] = {0};
+    int used_temp = 0;
 
     int use_stdin = (strcmp(inpath, "-") == 0);
     if (use_stdin) {
@@ -1016,8 +1222,16 @@ static int decrypt_file(const char *inpath, const char *outpath,
         if (use_stdout) {
             out_fd = STDOUT_FILENO;
         } else {
-            out_fd = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-            if (out_fd < 0) { perror("open output"); goto cleanup; }
+            /* Write to a sibling temp file and rename into place on success
+             * so a failed run never destroys an existing output. */
+            int tw = snprintf(out_tmpl, sizeof(out_tmpl), "%s.svtmp.XXXXXX", outpath);
+            if (tw < 0 || tw >= (int)sizeof(out_tmpl)) {
+                fprintf(stderr, "Error: output path too long\n");
+                goto cleanup;
+            }
+            out_fd = mkstemp(out_tmpl);
+            if (out_fd < 0) { perror("open output temp"); goto cleanup; }
+            used_temp = 1;
         }
     }
 
@@ -1046,6 +1260,8 @@ static int decrypt_file(const char *inpath, const char *outpath,
             goto cleanup;
         }
         zlib_ok = 1;
+        outbuf = malloc(CHUNK_SIZE);
+        if (!outbuf) { fprintf(stderr, "Out of memory\n"); goto cleanup; }
     }
 
     uint8_t *plain = sodium_malloc(CHUNK_SIZE + crypto_secretstream_xchacha20poly1305_ABYTES);
@@ -1077,7 +1293,6 @@ static int decrypt_file(const char *inpath, const char *outpath,
                 zstrm.avail_in = (uInt)plen;
                 zstrm.next_in = plain;
                 do {
-                    uint8_t outbuf[CHUNK_SIZE];
                     zstrm.avail_out = CHUNK_SIZE;
                     zstrm.next_out = outbuf;
                     int zrc = inflate(&zstrm, Z_NO_FLUSH);
@@ -1107,6 +1322,60 @@ static int decrypt_file(const char *inpath, const char *outpath,
     }
     sodium_free(plain);
 
+    /* Optional manifest trailer: cross-check the size and restore the
+     * original mode/mtime for single-file vaults. Best-effort only. */
+    {
+        int seekable = (lseek(in_fd, 0, SEEK_CUR) >= 0);
+        uint8_t *mp = NULL;
+        size_t mlen = 0;
+        int mrc = sv_read_manifest(in_fd, &vm, seekable, &mp, &mlen, NULL);
+        if (mrc == 0) {
+            if (mlen >= 3 && mp[0] == ENTRY_FILE) {
+                uint16_t pl16 = ((uint16_t)mp[1] << 8) | mp[2];
+                if ((size_t)(3u + pl16 + 24) <= mlen) {
+                    /* The writer stores "-" as the name for stdin sources
+                     * along with zeroed mode/mtime – nothing to restore. */
+                    int has_meta = !(pl16 == 1 && mp[3] == '-');
+                    uint64_t rec_size = get_u64be(mp + 3 + pl16);
+                    uint32_t rec_mode = ((uint32_t)mp[3 + pl16 + 8] << 24) |
+                                        ((uint32_t)mp[3 + pl16 + 9] << 16) |
+                                        ((uint32_t)mp[3 + pl16 + 10] << 8) |
+                                        (uint32_t)mp[3 + pl16 + 11];
+                    int64_t rec_msec = (int64_t)get_u64be(mp + 3 + pl16 + 12);
+                    int32_t rec_mnsec = get_i32be(mp + 3 + pl16 + 20);
+                    int cmp_ok = !verify_only || !(vm.flags & FLAG_COMPRESSED);
+                    if (cmp_ok && (uint64_t)decrypted_size != rec_size)
+                        fprintf(stderr, "Warning: decrypted size %lld differs from "
+                                        "recorded original size %llu\n",
+                                (long long)decrypted_size,
+                                (unsigned long long)rec_size);
+                    if (has_meta && !verify_only &&
+                        out_fd >= 0 && out_fd != STDOUT_FILENO) {
+                        if (fchmod(out_fd, rec_mode & 0777) != 0)
+                            perror("restore mode");
+                        struct timespec times[2] = { {0, UTIME_OMIT},
+                                                     {rec_msec, rec_mnsec} };
+                        if (futimens(out_fd, times) != 0)
+                            perror("restore mtime");
+                    }
+                }
+            }
+            sodium_memzero(mp, mlen);
+            free(mp);
+        } else if (mrc < 0) {
+            fprintf(stderr, "Warning: manifest trailer missing or failed "
+                            "authentication (payload itself is unaffected)\n");
+        }
+    }
+
+    if (used_temp) {
+        if (fsync(out_fd) != 0) perror("fsync output");
+        if (rename(out_tmpl, outpath) != 0) {
+            perror("rename output into place");
+            goto cleanup;
+        }
+    }
+
     if (verbose) fprintf(stderr, "%s %lld bytes OK\n",
                          verify_only ? "Verified" : "Decrypted",
                          (long long)decrypted_size);
@@ -1116,10 +1385,11 @@ cleanup:
     vault_wipe_dek(&vm);
     if (zlib_ok) inflateEnd(&zstrm);
     if (reader_ok) reader_free(&r);
+    free(outbuf);
     if (in_fd >= 0 && in_fd != STDIN_FILENO) close(in_fd);
     if (out_fd >= 0 && out_fd != STDOUT_FILENO) {
         close(out_fd);
-        if (ret != 0) unlink(outpath);
+        if (ret != 0 && used_temp) unlink(out_tmpl);
     }
     return ret;
 }
@@ -1178,10 +1448,59 @@ static int name_excluded(const char *relpath, char **pats, size_t n_pats) {
     return 0;
 }
 
+/* True when any ancestor directory of `relpath` is excluded – mirrors the
+ * writer's whole-subtree pruning so progress estimates stay accurate. */
+static int ancestor_excluded(const char *relpath, char **pats, size_t n_pats) {
+    if (n_pats == 0) return 0;
+    char buf[MAX_BUNDLE_PATH + 1];
+    const char *slash = strchr(relpath, '/');
+    while (slash) {
+        size_t seg = (size_t)(slash - relpath);
+        if (seg > 0 && seg <= MAX_BUNDLE_PATH) {
+            memcpy(buf, relpath, seg);
+            buf[seg] = '\0';
+            if (name_excluded(buf, pats, n_pats)) return 1;
+        }
+        slash = strchr(slash + 1, '/');
+    }
+    return 0;
+}
+
+/* nftw has no user-data parameter; this CLI is single-threaded. */
+struct sum_ctx { size_t base_len; char **ex; size_t nex; off_t total; };
+static struct sum_ctx *g_sum_ctx = NULL;
+
+static int sum_tree_cb(const char *path, const struct stat *sb,
+                       int typeflag, struct FTW *ftwbuf) {
+    (void)ftwbuf;
+    struct sum_ctx *c = g_sum_ctx;
+    if (c && typeflag == FTW_F && S_ISREG(sb->st_mode)) {
+        const char *rel = path + c->base_len;
+        while (*rel == '/') rel++;
+        if (!name_excluded(rel, c->ex, c->nex) &&
+            !ancestor_excluded(rel, c->ex, c->nex))
+            c->total += sb->st_size;
+    }
+    return 0;
+}
+
+/* Cheap pre-pass giving bundle encryption a real progress percentage. */
+static off_t estimate_tree_bytes(const char *base, char **ex, size_t nex) {
+    struct sum_ctx c;
+    memset(&c, 0, sizeof(c));
+    c.base_len = strlen(base);
+    c.ex = ex;
+    c.nex = nex;
+    g_sum_ctx = &c;
+    nftw(base, sum_tree_cb, 16, FTW_PHYS);
+    g_sum_ctx = NULL;
+    return c.total;
+}
+
 /* Iterative directory traversal using an explicit stack */
 static int bundle_add_tree(sv_writer_t *w, const char *base_in,
                            char **excludes, size_t n_excludes,
-                           mbuf_t *mf) {
+                           mbuf_t *mf, off_t total_bytes) {
     struct stack_node {
         char *rel;        /* relative path from base_in, or "" for root */
         int visited;      /* 0 = not yet enumerated, 1 = files processed */
@@ -1191,6 +1510,9 @@ static int bundle_add_tree(sv_writer_t *w, const char *base_in,
     int file_count = 0;
     off_t bytes_done = 0;
     int ret = -1;
+    uint8_t *file_buf = malloc(CHUNK_SIZE);
+
+    if (!file_buf) { fprintf(stderr, "Out of memory\n"); return -1; }
 
     /* Push root */
     stack = realloc(stack, (stack_sz + 1) * sizeof(*stack));
@@ -1355,18 +1677,17 @@ static int bundle_add_tree(sv_writer_t *w, const char *base_in,
                             goto cleanup;
                         }
                     }
-                    uint8_t *buf = malloc(CHUNK_SIZE);
+                    uint8_t *buf = file_buf;
                     ssize_t n;
                     while ((n = read_full(fd, buf, CHUNK_SIZE)) > 0) {
-                        if (g_interrupted) { free(buf); close(fd); break; }
+                        if (g_interrupted) { close(fd); break; }
                         if (writer_push(w, buf, (size_t)n,
                                         crypto_secretstream_xchacha20poly1305_TAG_MESSAGE) != 0) {
-                            free(buf); close(fd); goto cleanup;
+                            close(fd); goto cleanup;
                         }
                         bytes_done += n;
-                        progress_update(bytes_done, -1);
+                        progress_update(bytes_done, total_bytes);
                     }
-                    free(buf);
                     close(fd);
                     file_count++;
                     if (g_interrupted) break;
@@ -1389,6 +1710,7 @@ cleanup:
         stack_sz--;
     }
     free(stack);
+    free(file_buf);
     return ret;
 }
 
@@ -1449,7 +1771,11 @@ static int encrypt_dir(const char *dirpath, const char *outpath,
         close(out_fd); return -1;
     }
 
-    int file_count = bundle_add_tree(&w, dirpath, excludes, n_excludes, &mf);
+    /* Cheap pre-pass for a real progress percentage (only when -P is on) */
+    off_t total_bytes = g_progress ? estimate_tree_bytes(dirpath, excludes, n_excludes)
+                                   : -1;
+    int file_count = bundle_add_tree(&w, dirpath, excludes, n_excludes, &mf,
+                                     total_bytes);
     if (file_count < 0) {
         mbuf_free(&mf);
         writer_free(&w);
@@ -1529,15 +1855,14 @@ static int decrypt_dir_bundle(const char *inpath, const char *outdir,
 
     char staging[PATH_MAX * 2] = {0};
     if (!verify_only) {
-        /* Guard against existing output directory */
+        /* Guard against existing output directory. With -f the old tree is
+         * NOT removed here – it is renamed aside only after extraction has
+         * fully succeeded, so a failed run never destroys existing data. */
         struct stat st_out;
-        if (stat(outdir, &st_out) == 0) {
-            if (!force_overwrite) {
-                fprintf(stderr, "Output directory '%s' already exists. Use -f to force overwrite.\n", outdir);
-                reader_free(&r);
-                goto cleanup_fd;
-            }
-            recursive_remove(outdir);
+        if (stat(outdir, &st_out) == 0 && !force_overwrite) {
+            fprintf(stderr, "Output directory '%s' already exists. Use -f to force overwrite.\n", outdir);
+            reader_free(&r);
+            goto cleanup_fd;
         }
         snprintf(staging, sizeof(staging), "%s.svtmp.XXXXXX", outdir);
         if (mkdtemp(staging) == NULL) {
@@ -1556,6 +1881,13 @@ static int decrypt_dir_bundle(const char *inpath, const char *outdir,
     int32_t saved_mnsec = 0;
     char cur_path[PATH_MAX * 2] = {0};
 
+    /* Directory modes are applied only AFTER all contents have been written:
+     * chmod'ing a dir to a read-only mode up front would make writing the
+     * files inside it fail with EACCES. */
+    struct dmode_rec { char *path; uint32_t mode; };
+    struct dmode_rec *dmods = NULL;
+    size_t ndmods = 0, dmod_cap = 0;
+
     for (;;) {
         if (g_interrupted) { fprintf(stderr, "\nInterrupted\n"); goto cleanup; }
         size_t plen; uint8_t tag;
@@ -1572,6 +1904,7 @@ static int decrypt_dir_bundle(const char *inpath, const char *outdir,
         if (remaining_in_file == 0) {
             if (plen < 1) goto cleanup;
             if (plain[0] == ENTRY_END) {
+                if (plen != 1) goto cleanup;    /* strict: 1-byte end marker */
                 ret = 0;
                 if (tag == crypto_secretstream_xchacha20poly1305_TAG_FINAL) break;
                 continue;
@@ -1579,10 +1912,12 @@ static int decrypt_dir_bundle(const char *inpath, const char *outdir,
             if (plain[0] != ENTRY_FILE && plain[0] != ENTRY_DIR) goto cleanup;
             if (plen < 1 + 2) goto cleanup;
             uint16_t path_len = ((uint16_t)plain[1] << 8) | plain[2];
-            /* Minimum length for files: tag(1)+pathlen(2)+path+size(8)+mode(4)+mtime(12) = 27+path */
-            /* Minimum length for dirs:  tag(1)+pathlen(2)+path+mode(4) = 7+path */
-            if (plain[0] == ENTRY_FILE && plen < (size_t)(1 + 2 + path_len + 8 + 4 + 8 + 4)) goto cleanup;
-            if (plain[0] == ENTRY_DIR  && plen < (size_t)(1 + 2 + path_len + 4)) goto cleanup;
+            /* Exact entry sizes (FORMAT.md): a frame carries exactly one
+             * entry header, never straddling entry boundaries. */
+            size_t want_file = (size_t)(1 + 2 + path_len + 8 + 4 + 8 + 4);
+            size_t want_dir  = (size_t)(1 + 2 + path_len + 4);
+            if (plain[0] == ENTRY_FILE && plen != want_file) goto cleanup;
+            if (plain[0] == ENTRY_DIR  && plen != want_dir)  goto cleanup;
 
             char relpath[PATH_MAX];
             if (path_len >= sizeof(relpath)) goto cleanup;
@@ -1613,14 +1948,21 @@ static int decrypt_dir_bundle(const char *inpath, const char *outdir,
                 if (mkdir(cur_path, 0755) != 0 && errno != EEXIST) {
                     perror("mkdir"); goto cleanup;
                 }
-                /* Restore mode */
+                /* Defer mode restoration until all contents are written */
                 uint32_t mode = ((uint32_t)plain[3 + path_len] << 24) |
                                 ((uint32_t)plain[3 + path_len + 1] << 16) |
                                 ((uint32_t)plain[3 + path_len + 2] << 8) |
                                 (uint32_t)plain[3 + path_len + 3];
-                if (chmod(cur_path, mode) != 0) {
-                    perror("chmod dir"); /* non-fatal */
+                if (ndmods == dmod_cap) {
+                    dmod_cap = dmod_cap ? dmod_cap * 2 : 16;
+                    struct dmode_rec *nd = realloc(dmods, dmod_cap * sizeof(*nd));
+                    if (!nd) { perror("realloc"); goto cleanup; }
+                    dmods = nd;
                 }
+                dmods[ndmods].path = strdup(cur_path);
+                if (!dmods[ndmods].path) goto cleanup;
+                dmods[ndmods].mode = mode;
+                ndmods++;
                 files_done++;
                 continue;
             }
@@ -1637,8 +1979,7 @@ static int decrypt_dir_bundle(const char *inpath, const char *outdir,
             saved_mnsec = get_i32be(plain + 3 + path_len + 20);
 
             if (verify_only) {
-                files_done++;
-                if (remaining_in_file == 0) in_file = 0;
+                if (remaining_in_file == 0) { in_file = 0; files_done++; }
             } else {
                 int wrote = snprintf(cur_path, sizeof(cur_path), "%s/%s",
                                      staging, relpath);
@@ -1664,8 +2005,13 @@ static int decrypt_dir_bundle(const char *inpath, const char *outdir,
                 }
             }
         } else {
+            if ((off_t)plen > remaining_in_file) {
+                /* Writers must never straddle entry boundaries (FORMAT.md) */
+                fprintf(stderr, "[FAIL] Frame overruns the current file's "
+                                "declared size (invalid bundle)\n");
+                goto cleanup;
+            }
             size_t to_write = plen;
-            if ((off_t)to_write > remaining_in_file) to_write = (size_t)remaining_in_file;
             if (!verify_only) {
                 if (write_full(out_fd, plain, to_write) != (ssize_t)to_write) {
                     perror("write"); goto cleanup;
@@ -1690,11 +2036,22 @@ static int decrypt_dir_bundle(const char *inpath, const char *outdir,
 
     if (ret == 0 && in_file) ret = -1;
 
+    /* Restore directory modes now that every file has been written – doing
+     * this earlier would make read-only dirs un-writable mid-extract. */
+    if (ret == 0 && !verify_only) {
+        for (size_t i = 0; i < ndmods; i++) {
+            if (chmod(dmods[i].path, dmods[i].mode) != 0)
+                perror("chmod dir");   /* non-fatal */
+        }
+    }
+
 cleanup:
     if (out_fd >= 0) close(out_fd);
     if (plain) sodium_free(plain);
     vault_wipe_dek(&vm);
     reader_free(&r);
+    for (size_t i = 0; i < ndmods; i++) free(dmods[i].path);
+    free(dmods);
 
 cleanup_fd:
     if (in_fd >= 0 && in_fd != STDIN_FILENO) close(in_fd);
@@ -1706,11 +2063,44 @@ cleanup_fd:
     }
 
     if (ret == 0) {
+        /* Swap the finished staging dir into place. An existing output is
+         * renamed aside and only removed once the new tree is in place. */
+        int had_old = 0;
+        char olddir[PATH_MAX * 2] = {0};
+        struct stat st_out;
+        if (stat(outdir, &st_out) == 0) {
+            if (!force_overwrite) {
+                fprintf(stderr, "Output directory '%s' already exists. "
+                                "Use -f to force overwrite.\n", outdir);
+                recursive_remove(staging);
+                return -1;
+            }
+            if (S_ISDIR(st_out.st_mode)) {
+                snprintf(olddir, sizeof(olddir), "%s.svold.XXXXXX", outdir);
+                if (mkdtemp(olddir) == NULL) {
+                    perror("mkdtemp old output");
+                    recursive_remove(staging);
+                    return -1;
+                }
+                if (rename(outdir, olddir) != 0) {
+                    perror("rename old output aside");
+                    recursive_remove(staging);
+                    return -1;
+                }
+                had_old = 1;
+            } else if (unlink(outdir) != 0) {
+                perror("remove old output file");
+                recursive_remove(staging);
+                return -1;
+            }
+        }
         if (rename(staging, outdir) != 0) {
             perror("rename staging to outdir");
+            if (had_old) rename(olddir, outdir);   /* put the old tree back */
             recursive_remove(staging);
             return -1;
         }
+        if (had_old) recursive_remove(olddir);
         if (verbose) fprintf(stderr, "Extracted %d files to %s\n", files_done, outdir);
     } else {
         recursive_remove(staging);
@@ -1757,155 +2147,77 @@ static int cmd_list(const char *inpath, const char *password, size_t pw_len,
     }
 
     int seekable = (lseek(in_fd, 0, SEEK_CUR) >= 0);
-    off_t bytes_seen = (off_t)vm.raw_len;
-    uint8_t *discard = NULL;
-    if (!seekable) {
-        discard = malloc(256 * 1024);
-        if (!discard) { perror("malloc"); goto cleanup_dek; }
-    }
-
-    for (;;) {
-        if (g_interrupted) { fprintf(stderr, "\nInterrupted\n"); break; }
-
-        uint8_t len4[4];
-        ssize_t got = read_full(in_fd, len4, 4);
-        if (got == 0) {
-            fprintf(stderr, "Note: no manifest in this vault "
-                            "(written by an older version)\n");
-            ret = 0;
-            break;
-        }
-        if (got != 4) { fprintf(stderr, "[FAIL] Truncated stream\n"); break; }
-        bytes_seen += 4;
-
-        /* ---- manifest trailer? ---- */
-        if (memcmp(len4, SV_MANIFEST_MAGIC, 4) == 0) {
-            uint8_t ver1, nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
-            uint8_t ml8[8];
-            if (read_full(in_fd, &ver1, 1) != 1 || ver1 != SV_MANIFEST_VERSION ||
-                read_full(in_fd, nonce, sizeof(nonce)) != (ssize_t)sizeof(nonce) ||
-                read_full(in_fd, ml8, sizeof(ml8)) != (ssize_t)sizeof(ml8)) {
-                fprintf(stderr, "[FAIL] Malformed manifest trailer\n");
+    uint8_t *mp = NULL;
+    size_t mlen = 0;
+    off_t walked = 0;
+    int mrc = sv_read_manifest(in_fd, &vm, seekable, &mp, &mlen, &walked);
+    if (mrc == 1) {
+        fprintf(stderr, "Note: no manifest in this vault "
+                        "(written by an older version)\n");
+        ret = 0;
+    } else if (mrc < 0) {
+        fprintf(stderr, "[FAIL] Manifest missing, corrupt, or unauthentic\n");
+    } else {
+        printf("%-4s %14s %6s %17s %s\n",
+               "TYPE", "SIZE", "MODE", "MTIME", "PATH");
+        size_t pos = 0;
+        int nfiles = 0, ndirs = 0;
+        off_t total = 0;
+        while (pos + 3 <= mlen) {
+            uint8_t etag = mp[pos];
+            uint16_t pl16 = ((uint16_t)mp[pos + 1] << 8) | mp[pos + 2];
+            if ((etag != ENTRY_FILE && etag != ENTRY_DIR) ||
+                pos + 3u + pl16 > mlen)
                 break;
-            }
-            uint64_t mlen = get_u64be(ml8);
-            if (mlen < crypto_aead_xchacha20poly1305_ietf_ABYTES ||
-                mlen > SV_MANIFEST_MAX_CT) {
-                fprintf(stderr, "[FAIL] Implausible manifest length\n");
-                break;
-            }
-            unsigned char mkey[crypto_kdf_KEYBYTES];
-            unsigned char *ct = malloc((size_t)mlen);
-            unsigned char *pt = malloc((size_t)mlen);
-            if (!ct || !pt ||
-                crypto_kdf_derive_from_key(mkey, sizeof(mkey), 1, "SVmanif1", vm.dek) != 0 ||
-                read_full(in_fd, ct, (size_t)mlen) != (ssize_t)mlen) {
-                fprintf(stderr, "[FAIL] Manifest read failed\n");
-                sodium_memzero(mkey, sizeof(mkey));
-                free(ct); free(pt);
-                break;
-            }
-            unsigned long long plen = 0;
-            int rc = crypto_aead_xchacha20poly1305_ietf_decrypt(
-                pt, &plen, NULL, ct, mlen,
-                vm.aad, vm.aad_len, nonce, mkey);
-            sodium_memzero(mkey, sizeof(mkey));
-            sodium_memzero(ct, (size_t)mlen);
-            free(ct);
-            if (rc != 0) {
-                fprintf(stderr, "[FAIL] Manifest authentication failed\n");
-                free(pt);
-                break;
-            }
+            char path[MAX_BUNDLE_PATH + 1];
+            memcpy(path, mp + pos + 3, pl16);
+            path[pl16] = '\0';
+            sanitize_print(path);
+            const char *shown = path[0] ? path : (etag == ENTRY_FILE ? "-" : ".");
+            pos += 3u + pl16;
 
-            printf("%-4s %14s %6s %17s %s\n",
-                   "TYPE", "SIZE", "MODE", "MTIME", "PATH");
-            size_t pos = 0;
-            int nfiles = 0, ndirs = 0;
-            off_t total = 0;
-            while (pos + 3 <= plen) {
-                uint8_t etag = pt[pos];
-                uint16_t pl16 = ((uint16_t)pt[pos + 1] << 8) | pt[pos + 2];
-                if ((etag != ENTRY_FILE && etag != ENTRY_DIR) ||
-                    pos + 3u + pl16 > plen)
-                    break;
-                char path[MAX_BUNDLE_PATH + 1];
-                memcpy(path, pt + pos + 3, pl16);
-                path[pl16] = '\0';
-                sanitize_print(path);
-                const char *shown = path[0] ? path : (etag == ENTRY_FILE ? "-" : ".");
-                pos += 3u + pl16;
-
-                char datebuf[32] = "-";
-                if (etag == ENTRY_FILE) {
-                    if (pos + 24 > plen) break;
-                    uint64_t fsz = get_u64be(pt + pos);
-                    uint32_t fmode = ((uint32_t)pt[pos + 8] << 24) |
-                                     ((uint32_t)pt[pos + 9] << 16) |
-                                     ((uint32_t)pt[pos + 10] << 8) |
-                                     (uint32_t)pt[pos + 11];
-                    int64_t msec = (int64_t)get_u64be(pt + pos + 12);
-                    pos += 24;
-                    time_t ttv = (time_t)msec;
-                    struct tm tmv;
-                    if (localtime_r(&ttv, &tmv))
-                        strftime(datebuf, sizeof(datebuf), "%Y-%m-%d %H:%M", &tmv);
-                    printf("%-4s %14llu 0%04o %17s %s\n", "f",
-                           (unsigned long long)fsz, fmode & 0777, datebuf, shown);
-                    nfiles++;
-                    total += (off_t)fsz;
-                } else {
-                    if (pos + 4 > plen) break;
-                    uint32_t dmode = ((uint32_t)pt[pos] << 24) |
-                                     ((uint32_t)pt[pos + 1] << 16) |
-                                     ((uint32_t)pt[pos + 2] << 8) |
-                                     (uint32_t)pt[pos + 3];
-                    pos += 4;
-                    printf("%-4s %14s 0%04o %17s %s\n", "d", "-", dmode & 0777, "-", shown);
-                    ndirs++;
-                }
+            char datebuf[32] = "-";
+            if (etag == ENTRY_FILE) {
+                if (pos + 24 > mlen) break;
+                uint64_t fsz = get_u64be(mp + pos);
+                uint32_t fmode = ((uint32_t)mp[pos + 8] << 24) |
+                                 ((uint32_t)mp[pos + 9] << 16) |
+                                 ((uint32_t)mp[pos + 10] << 8) |
+                                 (uint32_t)mp[pos + 11];
+                int64_t msec = (int64_t)get_u64be(mp + pos + 12);
+                pos += 24;
+                time_t ttv = (time_t)msec;
+                struct tm tmv;
+                if (localtime_r(&ttv, &tmv))
+                    strftime(datebuf, sizeof(datebuf), "%Y-%m-%d %H:%M", &tmv);
+                printf("%-4s %14llu 0%04o %17s %s\n", "f",
+                       (unsigned long long)fsz, fmode & 0777, datebuf, shown);
+                nfiles++;
+                total += (off_t)fsz;
+            } else {
+                if (pos + 4 > mlen) break;
+                uint32_t dmode = ((uint32_t)mp[pos] << 24) |
+                                 ((uint32_t)mp[pos + 1] << 16) |
+                                 ((uint32_t)mp[pos + 2] << 8) |
+                                 (uint32_t)mp[pos + 3];
+                pos += 4;
+                printf("%-4s %14s 0%04o %17s %s\n", "d", "-", dmode & 0777, "-", shown);
+                ndirs++;
             }
-            sodium_memzero(pt, (size_t)plen);
-            free(pt);
-            fflush(stdout);
-            fprintf(stderr, "%d files, %d dirs, %lld bytes total\n",
-                    nfiles, ndirs, (long long)total);
-            ret = 0;
-            break;
         }
-
-        /* ---- payload frame: skip it ---- */
-        uint32_t clen = ((uint32_t)len4[0] << 24) | ((uint32_t)len4[1] << 16) |
-                        ((uint32_t)len4[2] << 8) | (uint32_t)len4[3];
-        if (clen < crypto_secretstream_xchacha20poly1305_ABYTES ||
-            clen > CHUNK_SIZE + crypto_secretstream_xchacha20poly1305_ABYTES) {
-            fprintf(stderr, "[FAIL] Corrupt frame length\n");
-            break;
-        }
-        if (seekable && lseek(in_fd, (off_t)clen, SEEK_CUR) < 0) {
-            fprintf(stderr, "[FAIL] Seek failed\n");
-            break;
-        }
-        if (!seekable) {
-            off_t left = (off_t)clen;
-            while (left > 0) {
-                size_t want = left > 256 * 1024 ? 256 * 1024 : (size_t)left;
-                ssize_t r = read_full(in_fd, discard, want);
-                if (r <= 0) { left = -1; break; }
-                left -= r;
-            }
-            if (left != 0) { fprintf(stderr, "[FAIL] Truncated stream\n"); break; }
-        }
-        bytes_seen += (off_t)clen;
-        progress_update(bytes_seen, -1);
+        sodium_memzero(mp, mlen);
+        free(mp);
+        fflush(stdout);
+        fprintf(stderr, "%d files, %d dirs, %lld bytes total\n",
+                nfiles, ndirs, (long long)total);
+        ret = 0;
     }
 
     if (ret == 0 && verbose)
-        fprintf(stderr, "Walked %lld bytes of frames\n", (long long)bytes_seen);
+        fprintf(stderr, "Walked %lld bytes of frames\n",
+                (long long)(walked + (off_t)vm.raw_len));
     progress_finish();
-    free(discard);
 
-cleanup_dek:
     vault_wipe_dek(&vm);
 
 cleanup_fd:
@@ -1957,7 +2269,33 @@ static int slot_op_open(const char *path, int *out_fd, vault_meta_t *vm) {
     return 0;
 }
 
-static int vault_rewrite_header(int fd, const vault_meta_t *vm) {
+/* Rewrite the vault header in place, crash-safely: the CURRENT on-disk
+ * header is first copied to <vault>.svbak and fsync'd, so a torn write of
+ * the new header never leaves the vault unopenable (restore with
+ * `dd if=<vault>.svbak of=<vault> conv=notrunc`). */
+static int vault_rewrite_header(int fd, const vault_meta_t *vm,
+                                const char *path) {
+    char bak[PATH_MAX + 8];
+    if (snprintf(bak, sizeof(bak), "%s.svbak", path) >= (int)sizeof(bak))
+        return -1;
+
+    uint8_t old[SV7_HDR_LEN];
+    if (lseek(fd, 0, SEEK_SET) < 0 ||
+        read_full(fd, old, vm->raw_len) != (ssize_t)vm->raw_len)
+        return -1;
+    int bfd = open(bak, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (bfd < 0) {
+        perror("open header backup");
+        return -1;
+    }
+    int bak_ok = (write_full(bfd, old, vm->raw_len) == (ssize_t)vm->raw_len &&
+                  fsync(bfd) == 0);
+    close(bfd);
+    if (!bak_ok) {
+        fprintf(stderr, "Error: could not back up current header, aborting\n");
+        return -1;
+    }
+
     if (lseek(fd, 0, SEEK_SET) < 0) return -1;
     if (write_full(fd, vm->raw, vm->raw_len) != (ssize_t)vm->raw_len) return -1;
     return fsync(fd);
@@ -2018,7 +2356,8 @@ static int require_v7(const vault_meta_t *vm) {
 static int cmd_addkey(const char *vault,
                       const char *pw, size_t pw_len, const uint8_t *kf, size_t kf_len,
                       const char *npw, size_t npw_len, const uint8_t *nkf, size_t nkf_len,
-                      int allow_empty) {
+                      int allow_empty,
+                      uint64_t n_ops, size_t n_mem, int custom_params) {
     int fd = -1, ret = -1;
     vault_meta_t vm;
     if (slot_op_open(vault, &fd, &vm) != 0) return -1;
@@ -2049,15 +2388,18 @@ static int cmd_addkey(const char *vault,
     }
 
     sv7_slot_t *slot = (sv7_slot_t *)(vm.raw + SV7_FIXED_LEN + free_idx * SV7_SLOT_SIZE);
-    if (fill_slot(slot, vm.dek, npw, npw_len, nkf, nkf_len,
-                  vm.opslimit, (size_t)vm.memlimit) != 0) {
+    if (fill_slot_ex(slot, vm.dek, npw, npw_len, nkf, nkf_len,
+                     custom_params ? n_ops : vm.opslimit,
+                     custom_params ? n_mem : (size_t)vm.memlimit,
+                     custom_params) != 0) {
         fprintf(stderr, "Key derivation failed\n");
         goto out;
     }
     vault_wipe_dek(&vm);
 
-    if (vault_rewrite_header(fd, &vm) != 0) { perror("rewrite header"); goto out; }
-    fprintf(stderr, "Added key slot %d\n", free_idx);
+    if (vault_rewrite_header(fd, &vm, vault) != 0) { perror("rewrite header"); goto out; }
+    fprintf(stderr, "Added key slot %d%s\n", free_idx,
+            custom_params ? " (per-slot KDF params)" : "");
     ret = 0;
 
 out:
@@ -2068,7 +2410,8 @@ out:
 static int cmd_passwd(const char *vault,
                       const char *pw, size_t pw_len, const uint8_t *kf, size_t kf_len,
                       const char *npw, size_t npw_len, const uint8_t *nkf, size_t nkf_len,
-                      int allow_empty) {
+                      int allow_empty,
+                      uint64_t n_ops, size_t n_mem, int custom_params) {
     int fd = -1, ret = -1, matched = -1;
     vault_meta_t vm;
     if (slot_op_open(vault, &fd, &vm) != 0) return -1;
@@ -2085,14 +2428,17 @@ static int cmd_passwd(const char *vault,
     }
 
     sv7_slot_t *slot = (sv7_slot_t *)(vm.raw + SV7_FIXED_LEN + matched * SV7_SLOT_SIZE);
-    if (fill_slot(slot, vm.dek, npw, npw_len, nkf, nkf_len,
-                  vm.opslimit, (size_t)vm.memlimit) != 0) {
+    if (fill_slot_ex(slot, vm.dek, npw, npw_len, nkf, nkf_len,
+                     custom_params ? n_ops : vm.opslimit,
+                     custom_params ? n_mem : (size_t)vm.memlimit,
+                     custom_params) != 0) {
         fprintf(stderr, "Key derivation failed\n");
         goto out;
     }
     vault_wipe_dek(&vm);
-    if (vault_rewrite_header(fd, &vm) != 0) { perror("rewrite header"); goto out; }
-    fprintf(stderr, "Rotated key slot %d\n", matched);
+    if (vault_rewrite_header(fd, &vm, vault) != 0) { perror("rewrite header"); goto out; }
+    fprintf(stderr, "Rotated key slot %d%s\n", matched,
+            custom_params ? " (per-slot KDF params)" : "");
     ret = 0;
 
 out:
@@ -2134,11 +2480,83 @@ static int cmd_delkey(const char *vault, long target_slot,
     sodium_memzero(slot, sizeof(*slot));
     slot->type = SV_SLOT_EMPTY;
 
-    if (vault_rewrite_header(fd, &vm) != 0) { perror("rewrite header"); goto out; }
+    if (vault_rewrite_header(fd, &vm, vault) != 0) { perror("rewrite header"); goto out; }
     fprintf(stderr, "Removed key slot %ld\n", target_slot);
     ret = 0;
 
 out:
+    if (fd >= 0) close(fd);
+    return ret;
+}
+
+/* list the key slots of a v7 vault. The slot type bytes are unencrypted, so
+ * this needs no password; if a credential is supplied it is tested against
+ * every slot and the match (if any) is reported. */
+static int cmd_slots(const char *vault, const char *pw, size_t pw_len,
+                     const uint8_t *kf, size_t kf_len) {
+    int fd = -1, ret = -1;
+    vault_meta_t vm;
+    memset(&vm, 0, sizeof(vm));
+
+    fd = open(vault, O_RDONLY);
+    if (fd < 0) { perror("open vault"); return -1; }
+    if (vault_read_header(fd, &vm) != 0) {
+        fprintf(stderr, "Invalid or unsupported vault\n");
+        goto out;
+    }
+
+    if (vm.version < 7) {
+        printf("SLOT TYPE\n"
+               "   0  passphrase (legacy v%u, embedded in header – run 'rekey' "
+               "to migrate)\n", vm.version);
+        ret = 0;
+        goto out;
+    }
+
+    printf("SLOT TYPE             KDF\n");
+    for (int i = 0; i < SV7_MAX_SLOTS; i++) {
+        const uint8_t *slot = vm.raw + SV7_FIXED_LEN + i * SV7_SLOT_SIZE;
+        switch (slot[0]) {
+        case SV_SLOT_EMPTY:
+            printf("%4d  empty\n", i);
+            break;
+        case SV_SLOT_PASS:
+            printf("%4d  passphrase      global (ops=%llu, mem=%llu bytes)\n",
+                   i, (unsigned long long)vm.opslimit,
+                   (unsigned long long)vm.memlimit);
+            break;
+        case SV_SLOT_PASS_PARAMS: {
+            if (slot[1] == SV_SLOT_PARAMS_MARKER) {
+                uint32_t ops16 = ((uint32_t)slot[2] << 8) | slot[3];
+                uint32_t kib   = ((uint32_t)slot[4] << 24) |
+                                 ((uint32_t)slot[5] << 16) |
+                                 ((uint32_t)slot[6] << 8)  | slot[7];
+                printf("%4d  passphrase      per-slot (ops=%u, mem=%u KiB)\n",
+                       i, ops16, kib);
+            } else {
+                printf("%4d  passphrase      per-slot (unknown encoding)\n", i);
+            }
+            break;
+        }
+        default:
+            printf("%4d  unknown (type %u)\n", i, slot[0]);
+        }
+    }
+
+    if (pw_len > 0 || kf_len > 0) {
+        int matched = -1;
+        if (vault_unlock_ex(&vm, pw, pw_len, kf, kf_len, &matched) == 0 &&
+            matched >= 0)
+            printf("credential matches slot %d\n", matched);
+        else {
+            fprintf(stderr, "[FAIL] the given credential matches no slot\n");
+            goto out;
+        }
+    }
+    ret = 0;
+
+out:
+    vault_wipe_dek(&vm);
     if (fd >= 0) close(fd);
     return ret;
 }
@@ -2171,18 +2589,65 @@ static int cmd_rekey(const char *src, const char *dst_opt,
     char *tmp = NULL;
     if (asprintf(&tmp, "%s.rekey.tmp", dst) < 0 || !tmp) { free(dst); return -1; }
 
+    /* Peek at the source's header + manifest (best-effort) so the migrated
+     * vault keeps the original compression flag, filename, mode and times. */
+    sv_meta_override mo; memset(&mo, 0, sizeof(mo));
+    mo.display_name = NULL;
+    int compress_src = 0;
+    {
+        int sfd = open(src, O_RDONLY);
+        if (sfd >= 0) {
+            vault_meta_t svm;
+            memset(&svm, 0, sizeof(svm));
+            if (vault_read_header(sfd, &svm) == 0 &&
+                vault_unlock(&svm, pw, pw_len, kf, kf_len) == 0) {
+                compress_src = (svm.flags & FLAG_COMPRESSED) ? 1 : 0;
+                uint8_t *mp = NULL;
+                size_t mlen = 0;
+                if (sv_read_manifest(sfd, &svm, 1, &mp, &mlen, NULL) == 0 &&
+                    mlen >= 3 && mp[0] == ENTRY_FILE) {
+                    uint16_t pl16 = ((uint16_t)mp[1] << 8) | mp[2];
+                    if ((size_t)(3u + pl16 + 24) <= mlen) {
+                        char *nm = malloc((size_t)pl16 + 1);
+                        if (nm) {
+                            memcpy(nm, mp + 3, pl16);
+                            nm[pl16] = '\0';
+                            mo.display_name = nm;
+                            mo.mode = ((uint32_t)mp[3 + pl16 + 8] << 24) |
+                                      ((uint32_t)mp[3 + pl16 + 9] << 16) |
+                                      ((uint32_t)mp[3 + pl16 + 10] << 8) |
+                                      (uint32_t)mp[3 + pl16 + 11];
+                            mo.mtime_sec = (int64_t)get_u64be(mp + 3 + pl16 + 12);
+                            mo.mtime_nsec = get_i32be(mp + 3 + pl16 + 20);
+                        }
+                    }
+                }
+                if (mp) { sodium_memzero(mp, mlen); free(mp); }
+                vault_wipe_dek(&svm);
+            }
+            close(sfd);
+        }
+    }
+
     fprintf(stderr, "Decrypting %s ...\n", src);
     int rc = decrypt_file(src, tmp, pw, pw_len, kf, kf_len, 0, verbose, 1);
     if (rc != 0) {
         fprintf(stderr, "Rekey aborted (decryption failed)\n");
+        free((char *)mo.display_name);
         unlink(tmp); free(tmp); free(dst);
         return -1;
     }
 
     fprintf(stderr, "Re-encrypting as v7 -> %s\n", dst);
     rc = encrypt_file(tmp, dst, pw, pw_len, kf, kf_len,
-                      0, DEFAULT_OPSLIMIT, DEFAULT_MEMLIMIT, 0, verbose, 1);
-    secure_delete(tmp, 0);
+                      compress_src, DEFAULT_OPSLIMIT, DEFAULT_MEMLIMIT, 0,
+                      verbose, 1, mo.display_name ? &mo : NULL);
+    free((char *)mo.display_name);
+
+    /* Overwrite the decrypted temp file before unlinking (it is plaintext). */
+    struct stat tst;
+    if (stat(tmp, &tst) == 0)
+        secure_delete(tmp, tst.st_size);
     unlink(tmp);
     free(tmp);
 
@@ -2245,12 +2710,13 @@ static int cmd_keygen(const char *outpath, uint64_t size_k, int force, int verbo
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "ShadowVault v6.1 – Envelope + XChaCha20-Poly1305 Secretstream\n\n"
+        "ShadowVault v7 – multi-slot envelope + XChaCha20-Poly1305 secretstream\n\n"
         "Usage:\n"
         "  %s enc <file|dir>    [options]\n"
         "  %s dec <vault>       [options]\n"
         "  %s verify <vault>    [options]\n"
         "  %s list <vault>              show contents from encrypted manifest\n"
+        "  %s slots <vault>             list key slots (optionally test a credential)\n"
         "  %s keygen [-o file]  [options]   generate random keyfile\n"
         "  %s addkey <vault>    [options]   add another password/keyfile slot\n"
         "  %s passwd <vault>    [options]   rotate the slot you unlock with\n"
@@ -2265,9 +2731,11 @@ static void usage(const char *prog) {
         "  -s, --shred               Securely overwrite + delete original after encrypting\n"
         "  -f, --force               Force overwrite of existing output\n"
         "  -P, --progress            Show progress on stderr\n"
-        "  -t, --opslimit <n>        Argon2id opslimit (encrypt only)\n"
-        "  -m, --memlimit <n>        Argon2id memlimit in bytes (encrypt only)\n"
+        "  -t, --opslimit <n>        Argon2id opslimit (enc: vault-global; addkey/passwd:\n"
+        "                            per-slot for the new/rotated credential)\n"
+        "  -m, --memlimit <n>        Argon2id memlimit in bytes (same scope as --opslimit)\n"
         "  -v, --verbose             Verbose output\n"
+        "  -V, --version             Print version and exit\n"
         "  -h, --help                This help\n"
         "      --exclude <glob>      Skip matching entries in dir mode (repeatable;\n"
         "                            matches relative path or basename, e.g. *.tmp)\n"
@@ -2278,9 +2746,15 @@ static void usage(const char *prog) {
         "      --new-pass-fd <n>     addkey/passwd: read new password from fd n\n"
         "      --new-keyfile <file>  addkey/passwd: keyfile for the new slot\n"
         "      --slot <n>            delkey: slot index to remove (0..7)\n\n"
-        "Argon2id cost is stored in the file header – no need to repeat at decrypt.\n"
-        "Directory mode bundles the whole tree into one authenticated stream.\n",
-        prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        "Notes:\n"
+        "  - Argon2id cost is stored in the vault header – no need to repeat at decrypt.\n"
+        "  - addkey/passwd with -t/-m create type-2 slots whose KDF params are stored\n"
+        "    per slot, letting you strengthen one credential without touching the rest.\n"
+        "  - Outputs are written to a temp file and renamed into place: a failed or\n"
+        "    interrupted run never destroys an existing output.\n"
+        "  - Slot operations back up the previous header to <vault>.svbak.\n"
+        "  - Directory mode bundles the whole tree into one authenticated stream.\n",
+        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
@@ -2299,8 +2773,13 @@ int main(int argc, char **argv) {
     long target_slot = -1;
     char *new_password = NULL;
     const char *new_keyfile_path = NULL;
+    uint8_t *keyfile_data = NULL;   /* declared up here: exit_mem cleans it up
+                                     * and some error paths jump there before
+                                     * the keyfile block below ever runs */
+    size_t keyfile_len = 0;
     uint64_t opslimit = DEFAULT_OPSLIMIT;
     uint64_t memlimit = DEFAULT_MEMLIMIT;
+    int ops_set = 0, mem_set = 0;
     uint64_t keygen_size = 32;
     size_t keyfile_max_size = DEFAULT_KEYFILE_MAX_SIZE;
     char **excludes = NULL;
@@ -2317,6 +2796,7 @@ int main(int argc, char **argv) {
         {"opslimit",   required_argument, 0, 't'},
         {"memlimit",   required_argument, 0, 'm'},
         {"verbose",    no_argument,       0, 'v'},
+        {"version",    no_argument,       0, 'V'},
         {"help",       no_argument,       0, 'h'},
         {"keyfile-max-size", required_argument, 0, 1000},   /* long-only */
         {"allow-empty-pass", no_argument,       0, 1001},
@@ -2331,7 +2811,7 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:k:o:cfsPt:m:vh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:k:o:cfsPt:m:vVh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p': password = optarg; break;
         case 'k': keyfile_path = optarg; break;
@@ -2346,6 +2826,7 @@ int main(int argc, char **argv) {
                               crypto_pwhash_OPSLIMIT_MAX, &opslimit) != 0) {
                 usage(argv[0]); return 1;
             }
+            ops_set = 1;
             break;
         case 'm': {
             uint64_t mem = 0;
@@ -2355,9 +2836,13 @@ int main(int argc, char **argv) {
                 usage(argv[0]); return 1;
             }
             memlimit = mem;
+            mem_set = 1;
             break;
         }
         case 'v': verbose = 1; break;
+        case 'V':
+            printf("ShadowVault v7 (SV07 wire format, reads SV06)\n");
+            return 0;
         case 'h': usage(argv[0]); return 0;
         case 1000: {
             uint64_t kmax = 0;
@@ -2436,7 +2921,7 @@ int main(int argc, char **argv) {
         int kret = cmd_keygen(kout, keygen_size, force_overwrite, verbose || progress);
         for (size_t i = 0; i < n_excludes; i++) free(excludes[i]);
         free(excludes);
-        fprintf(stderr, kret == 0 ? "[+] Success\n" : "[-] Operation failed\n");
+        fputs(kret == 0 ? "[+] Success\n" : "[-] Operation failed\n", stderr);
         return kret == 0 ? 0 : 1;
     }
 
@@ -2446,6 +2931,43 @@ int main(int argc, char **argv) {
         return 1;
     }
     target = argv[optind];
+
+    /* slots needs no password; with one supplied, the matching slot is
+     * reported. Handled before the password prompt for that reason. */
+    if (strcmp(action, "slots") == 0) {
+        if (optind + 1 < argc) {
+            fprintf(stderr, "Error: unexpected extra arguments\n");
+            for (size_t i = 0; i < n_excludes; i++) free(excludes[i]);
+            free(excludes);
+            return 1;
+        }
+        uint8_t *skf = NULL;
+        size_t skf_len = 0;
+        int kfail = 0;
+        if (keyfile_path &&
+            load_keyfile(keyfile_path, keyfile_max_size, &skf, &skf_len) != 0)
+            kfail = 1;
+        char *sprompt = NULL;
+        const char *spw = NULL;
+        if (!kfail) {
+            if (pass_fd >= 0) {
+                sprompt = read_pass_from_fd(pass_fd);
+                if (!sprompt) kfail = 1;
+                else spw = sprompt;
+            } else if (password && strcmp(password, "-") != 0) {
+                spw = password;
+            }
+        }
+        int sret = kfail ? -1
+                         : cmd_slots(target, spw, spw ? strlen(spw) : 0,
+                                     skf, skf_len);
+        free_keyfile(skf, skf_len);
+        wipe_pass_buf(sprompt);
+        for (size_t i = 0; i < n_excludes; i++) free(excludes[i]);
+        free(excludes);
+        fputs(sret == 0 ? "[+] Success\n" : "[-] Operation failed\n", stderr);
+        return sret == 0 ? 0 : 1;
+    }
 
     /* --pass-fd: read the password from a file descriptor (kept out of argv) */
     char *ext_pass = NULL;
@@ -2487,8 +3009,19 @@ int main(int argc, char **argv) {
         password = ext_pass;
     }
 
-    char pw_buf[256] = {0};
-    /* Lock BEFORE any secret is written so the page cannot hit swap mid-read */
+    /* Reading the target from stdin requires an explicit password: an
+     * interactive prompt would consume the first line of the piped data. */
+    if (strcmp(target, "-") == 0 && pass_fd < 0 &&
+        (!password || strcmp(password, "-") == 0)) {
+        fprintf(stderr, "Error: target is stdin; the password prompt would "
+                        "consume the piped data.\n"
+                        "       Supply the password via -p or --pass-fd.\n");
+        goto exit_mem;
+    }
+
+    char pw_buf[PASS_FD_MAX] = {0};
+    /* Lock BEFORE any secret is written so the page cannot hit swap mid-read.
+     * Same cap as --pass-fd so every password path accepts the same lengths. */
     if (sodium_mlock(pw_buf, sizeof(pw_buf)) != 0)
         fprintf(stderr, "Warning: could not lock password buffer (swap exposure possible)\n");
     if (!password || strcmp(password, "-") == 0) {
@@ -2496,15 +3029,22 @@ int main(int argc, char **argv) {
         fflush(stderr);
         if (!fgets(pw_buf, sizeof(pw_buf), stdin)) {
             fprintf(stderr, "Failed to read password\n");
-            return 1;
+            goto exit_mem;
         }
         pw_buf[strcspn(pw_buf, "\n")] = '\0';
+        if (strlen(pw_buf) == sizeof(pw_buf) - 1) {
+            /* Full buffer with no newline: only OK if nothing follows. */
+            int c = fgetc(stdin);
+            if (c != EOF && c != '\n') {
+                fprintf(stderr, "Error: password exceeds %d bytes\n",
+                        (int)sizeof(pw_buf) - 1);
+                goto exit_mem;
+            }
+        }
         password = pw_buf;
     }
     size_t pw_len = strlen(password);
 
-    uint8_t *keyfile_data = NULL;
-    size_t keyfile_len = 0;
     if (keyfile_path) {
         FILE *kf = fopen(keyfile_path, "rb");
         if (!kf) { perror("keyfile open"); return 1; }
@@ -2582,16 +3122,18 @@ int main(int argc, char **argv) {
 
             if (strcmp(action, "addkey") == 0)
                 ret = cmd_addkey(target, password, pw_len, keyfile_data, keyfile_len,
-                                 npw, strlen(npw), nkf, nkf_len, allow_empty_pass);
+                                 npw, strlen(npw), nkf, nkf_len, allow_empty_pass,
+                                 opslimit, (size_t)memlimit, ops_set || mem_set);
             else
                 ret = cmd_passwd(target, password, pw_len, keyfile_data, keyfile_len,
-                                 npw, strlen(npw), nkf, nkf_len, allow_empty_pass);
+                                 npw, strlen(npw), nkf, nkf_len, allow_empty_pass,
+                                 opslimit, (size_t)memlimit, ops_set || mem_set);
 
             free_keyfile(nkf, nkf_len);
             wipe_pass_buf(nprompt);
         }
         progress_finish();
-        fprintf(stderr, ret == 0 ? "[+] Success\n" : "[-] Operation failed\n");
+        fputs(ret == 0 ? "[+] Success\n" : "[-] Operation failed\n", stderr);
         goto exit_mem;
     }
 
@@ -2660,7 +3202,7 @@ int main(int argc, char **argv) {
             ret = encrypt_file(target, output, password, pw_len,
                                keyfile_data, keyfile_len,
                                compress, opslimit, memlimit,
-                               shred, verbose, force_overwrite);
+                               shred, verbose, force_overwrite, NULL);
         }
     } else if (strcmp(action, "list") == 0) {
         ret = cmd_list(target, password, pw_len,
@@ -2717,7 +3259,7 @@ int main(int argc, char **argv) {
     }
 
     progress_finish();
-    fprintf(stderr, ret == 0 ? "[+] Success\n" : "[-] Operation failed\n");
+    fputs(ret == 0 ? "[+] Success\n" : "[-] Operation failed\n", stderr);
 
 exit_mem:
     if (ext_pass) {

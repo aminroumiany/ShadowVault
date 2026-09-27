@@ -29,7 +29,7 @@ Each key *slot* independently wraps the same DEK under its own credential.
 `addkey`/`passwd`/`delkey` rewrite only the slot area - never the DEK, the
 stream, or anything covered by AAD.
 
-## Header (v7) - 830 bytes, packed, no padding
+## Header (v7) - 832 bytes, packed, no padding
 
 ```
 offset  size  field
@@ -48,17 +48,25 @@ offset  size  field
 
 ```
 off size field
-0   1    type             0 = empty, 1 = passphrase (+ optional keyfile)
-1   7    reserved
+0   1    type             0 = empty, 1 = passphrase (global KDF params),
+                            2 = passphrase with per-slot KDF params
+1   7    reserved         for type 2: [0]=0x01 marker,
+                            [1..2]=opslimit u16 BE, [3..6]=memlimit KiB u32 BE
 8   16   kdf_salt         per-slot Argon2id salt
 24  24   wrap_nonce       per-slot secretbox nonce
 48  48   wrapped_dek      secretbox output: 32B ciphertext + 16B MAC
 ```
 
-Slots are **self-describing**: readers scan all 8 and skip `type == 0`.
-There is deliberately no slot-count field - any count stored near offset 6
-would sit inside the AAD prefix, making every add/remove a stream-breaking
-event (an earlier draft made exactly that mistake).
+Slots are **self-describing**: readers scan all 8 and skip `type == 0` (and
+any type they do not understand). There is deliberately no slot-count field -
+any count stored near offset 6 would sit inside the AAD prefix, making every
+add/remove a stream-breaking event (an earlier draft made exactly that
+mistake).
+
+Type 2 slots (written by `addkey`/`passwd` when `-t`/`-m` is supplied) carry
+their own Argon2id cost so one credential can be strengthened without
+touching the others; the u16/u32 encodings cap opslimit at 65535 and memlimit
+at 4 TiB in KiB steps.
 
 ### AAD rule (critical)
 
@@ -70,6 +78,14 @@ never change without re-encrypting the first block - which is why `rekey`
 (v6 to v7 migration) performs a full decrypt/re-encrypt.
 
 Wrong-credential unlock cost: one Argon2id run per occupied slot (up to 8).
+
+### Crash safety of slot operations
+
+`addkey`/`passwd`/`delkey` rewrite the header in place. Before writing, the
+CURRENT on-disk header is copied to `<vault>.svbak` and fsync'd; only then is
+the new header written and fsync'd. A torn write therefore always leaves a
+recoverable previous header (restore with
+`dd if=<vault>.svbak of=<vault> conv=notrunc bs=1 seek=0`).
 
 ## Header (v6, legacy) - 134 bytes
 
@@ -122,7 +138,10 @@ authenticate payload frames. `verify` remains the full-integrity operation.
 
 Writers store the true original plaintext size per file (so compressed vaults
 list their real sizes) and, for single-file mode, the original basename
-("-" for stdin).
+("-" for stdin). Single-file `dec` uses the trailer to restore the original
+mode and mtime onto the output file (skipped for stdin vaults, which record
+zeroed metadata) and warns if the decrypted size disagrees with the recorded
+size.
 
 ## Single-file layout
 
@@ -147,7 +166,10 @@ ENTRY_FILE meta: size u64 BE, mode u32 BE,
 ```
 
 - After an `ENTRY_FILE`, exactly `size` plaintext bytes follow across one or
-  more frames (frames may straddle entry boundaries arbitrarily).
+  more frames. **Frames never straddle entry boundaries**: each frame carries
+  exactly one entry header or a contiguous run of one file's data, and entry
+  header frames carry exactly the entry's bytes (readers must treat an
+  overrun as corruption).
 - The root directory is emitted as `ENTRY_DIR` with path `"."`.
 - The final frame carries `TAG_FINAL` with 1 plaintext byte `ENTRY_END` (0).
 
@@ -160,8 +182,14 @@ Traversal rules (writer):
 Extraction rules (reader):
 - Paths are extracted into a staging dir `<outdir>.svtmp.XXXXXX` and atomically
   renamed into place on success; staging is removed on any failure/interrupt.
+- With `-f`, an existing output directory is renamed aside (`.svold.XXXXXX`)
+  and removed only AFTER the new tree is fully extracted and swapped in – a
+  failed extraction never destroys existing data.
 - Reject absolute paths and paths containing `..`.
-- Parent directories are created as needed (0755), then final modes/times are
+- Frames that overrun the current file's declared size are rejected.
+- Parent directories are created as needed (0755); directory modes are
+  restored only after all contents are written (a read-only dir mode applied
+  early would block writing the files inside it), then file modes/times are
   applied via chmod + utimensat.
 
 ## CLI contract
@@ -169,9 +197,20 @@ Extraction rules (reader):
 - Exit code 0 on success, 1 on usage/validation errors, 255-style (-1) on
   operational failure.
 - `-` as input/output selects stdin/stdout (bundles cannot be auto-detected
-  from stdin; they fail with an explicit message).
+  from stdin; they fail with an explicit message). Supplying stdin as the
+  target requires an explicit password (`-p`/`--pass-fd`) – an interactive
+  prompt would consume the piped data.
 - Default outputs: `enc` appends `.vault`; `dec` strips `.vault`, else appends
   `.dec`; bundle `dec` uses `<target>_extracted`.
+- Outputs (except stdout) are written to a sibling `<name>.svtmp.XXXXXX` temp
+  file and renamed into place only on success, so a failed or interrupted run
+  never destroys an existing output.
+- `slots <vault>` lists the unencrypted slot table without any credential; if
+  `-p`/`-k` is supplied it additionally reports which slot (if any) the
+  credential opens.
+- Header KDF params are validated against libsodium's limits on read; a
+  vault requesting more than 1 GiB of Argon2id memory prints a warning
+  (tamper-evidence against memory-exhaustion DoS via a modified header).
 
 ## Known limitations
 

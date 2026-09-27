@@ -1,0 +1,15 @@
+# large local artifacts
+disk
+disk.*
+*.img
+
+# vaults and key material (never commit)
+*.vault
+*.vault.*
+*.svbak
+*.key
+
+# build artifacts
+shadowvault
+shadowvault_st
+*.o
