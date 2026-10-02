@@ -430,10 +430,83 @@ printf 'pwr\n' | sv passwd ps2.vault -p pws -t 4 -m 8388608 >/dev/null 2>&1
 sv verify ps2.vault -p pwr >/dev/null 2>&1;                chk $? "rotated per-slot credential verifies"
 
 ############################################
+section "compression probe (incompressible data)"
+############################################
+flagbyte() { dd if="$1" bs=1 skip=5 count=1 2>/dev/null | od -An -tu1 | tr -d ' '; }
+rm -f cp1.bin cp1.vault cp1.out
+head -c 2000000 /dev/urandom > cp1.bin
+echo -n pw | enc cp1.bin -c -o cp1.vault 2>/dev/null
+[ "$(flagbyte cp1.vault)" = "0" ];                         chk $? "random data stored raw despite -c"
+dec cp1.vault -p pw -o cp1.out -f 2>/dev/null
+cmp -s cp1.bin cp1.out;                                    chk $? "probed-skip roundtrip"
+rm -f cp2.bin cp2.vault cp2.out
+head -c 2000000 /dev/zero > cp2.bin
+echo -n pw | enc cp2.bin -c -o cp2.vault 2>/dev/null
+[ "$(flagbyte cp2.vault)" = "1" ];                         chk $? "compressible data still compressed"
+dec cp2.vault -p pw -o cp2.out -f 2>/dev/null
+cmp -s cp2.bin cp2.out;                                    chk $? "compressed roundtrip"
+rm -f cp3.vault cp3.out
+cat cp1.bin | sv enc - -c -p pw -o cp3.vault 2>/dev/null
+[ "$(flagbyte cp3.vault)" = "0" ];                         chk $? "stdin probe skips compression"
+dec cp3.vault -p pw -o cp3.out -f 2>/dev/null
+cmp -s cp1.bin cp3.out;                                    chk $? "stdin probed-skip roundtrip"
+: > cp4.bin
+echo -n pw | enc cp4.bin -c -o cp4.vault -f 2>/dev/null;   chk $? "empty file with -c enc"
+dec cp4.vault -p pw -o cp4.out -f 2>/dev/null && [ ! -s cp4.out ]
+                                                           chk $? "empty file with -c dec (regression)"
+
+############################################
 section "version flag"
 ############################################
 sv -V 2>/dev/null | grep -q "v7";                          chk $? "-V prints version"
 sv --version 2>/dev/null | grep -q "v7";                   chk $? "--version works"
+
+############################################
+section "hidden-echo password prompt (pty)"
+############################################
+if command -v python3 >/dev/null 2>&1; then
+    rm -f tty.bin tty.vault tty.out pty_test.py
+    head -c 200 /dev/urandom > tty.bin
+    cat > pty_test.py <<'PYEOF'
+import os, pty, select, sys
+
+def run(args, password):
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execv(args[0], args)
+        os._exit(127)
+    sent = False
+    out = b""
+    while True:
+        r, _, _ = select.select([fd], [], [], 10)
+        if not r:
+            break
+        try:
+            d = os.read(fd, 4096)
+        except OSError:
+            break
+        if not d:
+            break
+        out += d
+        if not sent and b"Password:" in out:
+            os.write(fd, password)
+            sent = True
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status), out
+
+rc, out = run([sys.argv[1], "enc", "tty.bin", "-o", "tty.vault"], b"pwtty\n")
+assert rc == 0, f"enc rc={rc}: {out!r}"
+assert b"pwtty" not in out, "password was echoed to the terminal!"
+rc, out = run([sys.argv[1], "dec", "tty.vault", "-o", "tty.out", "-f"], b"pwtty\n")
+assert rc == 0, f"dec rc={rc}: {out!r}"
+print("PTY-OK")
+PYEOF
+    python3 pty_test.py "$BIN" >/dev/null 2>&1;               chk $? "pty prompt enc+dec, password not echoed"
+    cmp -s tty.bin tty.out;                                   chk $? "pty roundtrip content"
+    rm -f pty_test.py
+else
+    skip "pty prompt test (python3 not available)"
+fi
 
 ############################################
 section "ASan subset"

@@ -31,6 +31,10 @@ legacy `SV06` vaults are read-only and can be migrated with `rekey`).
 - **Keyfile support** — combine a binary keyfile with a password before key
   derivation (`keygen` creates random keyfiles).
 - **Optional zlib compression** — independent gzip member per frame (`-c`).
+  Before encrypting, a multi-point sample of the input is deflated; if it
+  would save less than ~5%, compression is skipped automatically (useful for
+  disk images and other incompressible bulk). The decision is stored in the
+  vault header, so decryption needs no flags.
 - **Integrity verification** — `verify` authenticates every frame in memory
   without writing output.
 - **Crash-safe output** — vaults and extractions are written to temp files
@@ -43,6 +47,9 @@ legacy `SV06` vaults are read-only and can be migrated with `rekey`).
   output.
 - **Memory security** — keys, passwords, and keyfiles live in
   `sodium_malloc`'d, `mlock`ed buffers that are zeroed on release.
+- **Hidden password input** — interactive prompts disable terminal echo
+  (Ctrl-C can't leave your terminal with echo off); `--pass-fd` exists for
+  scripts.
 
 ## Dependencies
 

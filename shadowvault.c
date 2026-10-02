@@ -75,6 +75,7 @@
 #include <ctype.h>
 #include <ftw.h>
 #include <fnmatch.h>
+#include <termios.h>
 
 /* ----- Constants ----- */
 #define SV_MAGIC        "SV06"
@@ -935,8 +936,73 @@ typedef struct {
  * Single file encrypt / decrypt
  * ========================================================================== */
 
+/* Decide whether zlib compression pays off: deflate a small sample and keep
+ * compression only when it saves real space (>= 5%). Sampling 4 x 64 KiB
+ * from across a seekable input avoids being fooled by a compressible header
+ * region in front of random bulk (e.g. disk images); pipes are probed from
+ * one leading sample which the caller must feed back into the stream
+ * (returned via *prefix_out, ownership passes to the caller).
+ * Returns 1 to compress, 0 to store raw. */
+static int probe_compression(int in_fd, int seekable, off_t fsize,
+                             uint8_t **prefix_out, size_t *prefix_len_out) {
+    *prefix_out = NULL;
+    *prefix_len_out = 0;
+    const size_t SAMPLE = 64 * 1024;
+    enum { NSAMP = 4 };
+    uint8_t *raw = malloc(SAMPLE * NSAMP);
+    if (!raw) return 1;                 /* fail open: honor the -c request */
+
+    size_t total = 0;
+    if (seekable) {
+        if (fsize <= (off_t)(2 * SAMPLE)) {
+            ssize_t r = pread(in_fd, raw, SAMPLE, 0);
+            if (r > 0) total = (size_t)r;
+        } else {
+            for (int i = 0; i < NSAMP; i++) {
+                off_t off = (off_t)(((uint64_t)fsize * (uint64_t)i) / NSAMP);
+                ssize_t r = pread(in_fd, raw + total, SAMPLE, off);
+                if (r > 0) total += (size_t)r;
+            }
+        }
+    } else {
+        ssize_t r = read_full(in_fd, raw, SAMPLE * NSAMP);
+        if (r > 0) {
+            total = (size_t)r;
+            *prefix_out = raw;          /* consumed from the pipe: re-feed */
+            *prefix_len_out = total;
+            raw = NULL;
+        }
+    }
+
+    int keep = 1;
+    if (total > 0) {
+        z_stream zs;
+        memset(&zs, 0, sizeof(zs));
+        if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8,
+                         Z_DEFAULT_STRATEGY) == Z_OK) {
+            size_t cap = deflateBound(&zs, (uLong)total);
+            uint8_t *comp = malloc(cap);
+            if (comp) {
+                zs.avail_in = (uInt)total;
+                zs.next_in = raw ? raw : *prefix_out;
+                zs.avail_out = (uInt)cap;
+                zs.next_out = comp;
+                if (deflate(&zs, Z_FINISH) == Z_STREAM_END) {
+                    size_t csize = cap - (size_t)zs.avail_out;
+                    keep = (csize * 100 < total * 95);
+                }
+                free(comp);
+            }
+            deflateEnd(&zs);
+        }
+    }
+    free(raw);
+    return keep;
+}
+
 static int encrypt_stream_body(int in_fd, sv_writer_t *w, int use_zlib,
-                                off_t total, off_t *processed_out) {
+                                off_t total, off_t *processed_out,
+                                const uint8_t *prefix, size_t prefix_len) {
     z_stream zstrm;
     memset(&zstrm, 0, sizeof(zstrm));
     if (use_zlib) {
@@ -963,7 +1029,14 @@ static int encrypt_stream_body(int in_fd, sv_writer_t *w, int use_zlib,
      * frame bound of CHUNK_SIZE + ABYTES enforced by writer/reader. */
     const size_t chunk_in = use_zlib ? CHUNK_SIZE - COMP_SLACK : CHUNK_SIZE;
 
-    n = read_full(in_fd, cur_buf, chunk_in);
+    /* First chunk comes from the probe prefix (stdin was sampled) or the
+     * input itself. prefix_len <= 256 KiB always fits one chunk. */
+    if (prefix_len > 0) {
+        memcpy(cur_buf, prefix, prefix_len);
+        n = (ssize_t)prefix_len;
+    } else {
+        n = read_full(in_fd, cur_buf, chunk_in);
+    }
     if (n < 0) goto done;
 
     if (n == 0) {
@@ -1032,6 +1105,10 @@ static int encrypt_file(const char *inpath, const char *outpath,
     int writer_ok = 0;
     char out_tmpl[PATH_MAX] = {0};
     int used_temp = 0;
+    uint8_t *prefix = NULL;    /* declared with the other cleanup-managed
+                                * state: some error paths goto cleanup
+                                * before the probe block below runs */
+    size_t prefix_len = 0;
 
     /* Guard against overwriting existing output */
     if (!force_overwrite && strcmp(outpath, "-") != 0) {
@@ -1074,11 +1151,25 @@ static int encrypt_file(const char *inpath, const char *outpath,
         used_temp = 1;
     }
 
+    /* If -c was requested, probe first: compression that saves nothing is
+     * skipped (decision persisted in the header flag). */
+    int use_zlib = compress;
+    if (compress) {
+        int seekable = !use_stdin && (lseek(in_fd, 0, SEEK_CUR) >= 0);
+        if (!probe_compression(in_fd, seekable, use_stdin ? -1 : st.st_size,
+                               &prefix, &prefix_len))
+            use_zlib = 0;
+        if (verbose)
+            fprintf(stderr, "compression: %s\n",
+                    use_zlib ? "on (data compresses)"
+                             : "skipped (data does not compress enough)");
+    }
+
     sv7_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     memcpy(hdr.magic, SV7_MAGIC, 4);
     hdr.version = SV7_VERSION;
-    hdr.flags = compress ? FLAG_COMPRESSED : 0;
+    hdr.flags = use_zlib ? FLAG_COMPRESSED : 0;
     put_u64be(hdr.opslimit_be, opslimit);
     put_u64be(hdr.memlimit_be, memlimit);
 
@@ -1109,8 +1200,9 @@ static int encrypt_file(const char *inpath, const char *outpath,
     }
 
     off_t processed = 0;
-    if (encrypt_stream_body(in_fd, &w, compress,
-                            use_stdin ? -1 : st.st_size, &processed) != 0) {
+    if (encrypt_stream_body(in_fd, &w, use_zlib,
+                            use_stdin ? -1 : st.st_size, &processed,
+                            prefix, prefix_len) != 0) {
         fprintf(stderr, "Encryption failed or interrupted\n");
         goto cleanup;
     }
@@ -1176,6 +1268,7 @@ cleanup:
     sodium_munlock(dek, DEK_SIZE);
     sodium_memzero(dek, DEK_SIZE);
     if (writer_ok) writer_free(&w);
+    free(prefix);
     if (in_fd >= 0 && in_fd != STDIN_FILENO) close(in_fd);
     if (out_fd >= 0 && out_fd != STDOUT_FILENO) {
         close(out_fd);
@@ -1281,11 +1374,13 @@ static int decrypt_file(const char *inpath, const char *outpath,
         if (rc == 0) break;
 
         if (!verify_only) {
-            if (zlib_ok) {
+            if (zlib_ok && plen > 0) {
                 /* Each ciphertext message holds one complete gzip member
                  * (the encryptor finishes + resets per chunk), so the inflate
                  * state must be reset before every message or all chunks
-                 * after the first silently decompress to nothing. */
+                 * after the first silently decompress to nothing. plen == 0
+                 * (empty final frame, e.g. empty input) has nothing to
+                 * inflate. */
                 if (inflateReset(&zstrm) != Z_OK) {
                     fprintf(stderr, "Decompression reset failed\n");
                     sodium_free(plain); goto cleanup;
@@ -2231,27 +2326,81 @@ cleanup_fd:
 
 #define PASS_BUF_CAP 4096
 
-/* Read a NUL-terminated password from fd into a locked buffer (strips CR/LF). */
-static char *read_pass_from_fd(int fd) {
+/* Read a password line from fd into buf (NUL-terminated, trailing newline
+ * stripped). When fd is a terminal, echo is disabled while reading and
+ * SIGINT/SIGTERM are held off so Ctrl-C cannot leave the terminal with echo
+ * turned off. prompt (may be NULL) is printed to stderr.
+ * Returns the password length, or -1 on read error / over-long input. */
+static ssize_t read_pass_line(int fd, char *buf, size_t bufsz, const char *prompt) {
+    int tty = isatty(fd);
+    struct termios oldt;
+    int echo_off = 0;
+    void (*old_int)(int) = SIG_DFL;
+    void (*old_term)(int) = SIG_DFL;
+
+    if (tty) {
+        if (tcgetattr(fd, &oldt) == 0) {
+            struct termios noecho = oldt;
+            noecho.c_lflag &= ~(tcflag_t)ECHO;
+            /* TCSANOW, not TCSAFLUSH: never discard typed-ahead input
+             * (flushing it would swallow passwords piped through a pty). */
+            if (tcsetattr(fd, TCSANOW, &noecho) == 0) echo_off = 1;
+        }
+        old_int  = signal(SIGINT, SIG_IGN);
+        old_term = signal(SIGTERM, SIG_IGN);
+    }
+    if (prompt) { fputs(prompt, stderr); fflush(stderr); }
+
+    ssize_t rc = -1;
+    size_t off = 0;
+    for (;;) {
+        if (off >= bufsz - 1) {
+            /* Buffer full with no newline: fine only if nothing follows. */
+            char probe;
+            ssize_t pr = read_full(fd, &probe, 1);
+            if (pr == 1 && probe != '\n')
+                fprintf(stderr, "Error: password exceeds %d bytes\n",
+                        (int)bufsz - 1);
+            else if (pr < 0)
+                perror("read password");
+            else
+                rc = (ssize_t)off;
+            break;
+        }
+        ssize_t r = read_full(fd, buf + off, 1);
+        if (r < 0) { perror("read password"); break; }
+        if (r == 0) { rc = (ssize_t)off; break; }              /* EOF */
+        if (buf[off] == '\n') { rc = (ssize_t)off; break; }
+        off++;
+    }
+
+    if (tty) {
+        signal(SIGINT, old_int);
+        signal(SIGTERM, old_term);
+        if (echo_off) {
+            tcsetattr(fd, TCSANOW, &oldt);
+            fputc('\n', stderr);
+        }
+    }
+    if (rc >= 0) {
+        if (rc > 0 && buf[rc - 1] == '\r') rc--;   /* tolerate CRLF input */
+        buf[rc] = '\0';
+    }
+    return rc;
+}
+
+/* Read a NUL-terminated password from fd into a locked buffer. */
+static char *read_pass_from_fd(int fd, const char *prompt) {
     char *buf = sodium_malloc(PASS_BUF_CAP);
     if (!buf) return NULL;
     if (sodium_mlock(buf, PASS_BUF_CAP) != 0)
         fprintf(stderr, "Warning: could not lock password buffer\n");
-    size_t off = 0;
-    ssize_t r = 0;
-    while (off < PASS_BUF_CAP - 1 &&
-           (r = read_full(fd, buf + off, PASS_BUF_CAP - 1 - off)) > 0)
-        off += (size_t)r;
-    if (r < 0 ||
-        (off == PASS_BUF_CAP - 1 && read_full(fd, buf + off, 1) > 0)) {
-        fprintf(stderr, "Error: password read failed or too long\n");
+    if (read_pass_line(fd, buf, PASS_BUF_CAP, prompt) < 0) {
+        sodium_munlock(buf, PASS_BUF_CAP);
         sodium_memzero(buf, PASS_BUF_CAP);
         sodium_free(buf);
         return NULL;
     }
-    if (off > 0 && buf[off - 1] == '\n') off--;
-    if (off > 0 && buf[off - 1] == '\r') off--;
-    buf[off] = '\0';
     return buf;
 }
 
@@ -2951,7 +3100,7 @@ int main(int argc, char **argv) {
         const char *spw = NULL;
         if (!kfail) {
             if (pass_fd >= 0) {
-                sprompt = read_pass_from_fd(pass_fd);
+                sprompt = read_pass_from_fd(pass_fd, NULL);
                 if (!sprompt) kfail = 1;
                 else spw = sprompt;
             } else if (password && strcmp(password, "-") != 0) {
@@ -2980,32 +3129,12 @@ int main(int argc, char **argv) {
         if (!ext_pass) { perror("sodium_malloc"); return 1; }
         if (sodium_mlock(ext_pass, PASS_FD_MAX) != 0)
             fprintf(stderr, "Warning: could not lock pass-fd buffer\n");
-        size_t off = 0;
-        ssize_t r = 0;
-        while (off < PASS_FD_MAX - 1 &&
-               (r = read_full(pass_fd, ext_pass + off, PASS_FD_MAX - 1 - off)) > 0)
-            off += (size_t)r;
-        if (r < 0) {
-            perror("read pass-fd");
+        if (read_pass_line(pass_fd, ext_pass, PASS_FD_MAX, NULL) < 0) {
             sodium_munlock(ext_pass, PASS_FD_MAX);
             sodium_memzero(ext_pass, PASS_FD_MAX);
             sodium_free(ext_pass);
             return 1;
         }
-        if (off == PASS_FD_MAX - 1) {
-            char probe;
-            if (read_full(pass_fd, &probe, 1) > 0) {
-                fprintf(stderr, "Error: password from pass-fd exceeds %d bytes\n",
-                        PASS_FD_MAX - 1);
-                sodium_munlock(ext_pass, PASS_FD_MAX);
-                sodium_memzero(ext_pass, PASS_FD_MAX);
-                sodium_free(ext_pass);
-                return 1;
-            }
-        }
-        if (off > 0 && ext_pass[off - 1] == '\n') off--;
-        if (off > 0 && ext_pass[off - 1] == '\r') off--;
-        ext_pass[off] = '\0';
         password = ext_pass;
     }
 
@@ -3025,21 +3154,10 @@ int main(int argc, char **argv) {
     if (sodium_mlock(pw_buf, sizeof(pw_buf)) != 0)
         fprintf(stderr, "Warning: could not lock password buffer (swap exposure possible)\n");
     if (!password || strcmp(password, "-") == 0) {
-        fprintf(stderr, "Password: ");
-        fflush(stderr);
-        if (!fgets(pw_buf, sizeof(pw_buf), stdin)) {
+        if (read_pass_line(STDIN_FILENO, pw_buf, sizeof(pw_buf),
+                           "Password: ") < 0) {
             fprintf(stderr, "Failed to read password\n");
             goto exit_mem;
-        }
-        pw_buf[strcspn(pw_buf, "\n")] = '\0';
-        if (strlen(pw_buf) == sizeof(pw_buf) - 1) {
-            /* Full buffer with no newline: only OK if nothing follows. */
-            int c = fgetc(stdin);
-            if (c != EOF && c != '\n') {
-                fprintf(stderr, "Error: password exceeds %d bytes\n",
-                        (int)sizeof(pw_buf) - 1);
-                goto exit_mem;
-            }
         }
         password = pw_buf;
     }
@@ -3104,13 +3222,11 @@ int main(int argc, char **argv) {
                 goto exit_mem;
             }
             if (new_pass_fd >= 0) {
-                nprompt = read_pass_from_fd(new_pass_fd);
+                nprompt = read_pass_from_fd(new_pass_fd, NULL);
                 if (!nprompt) goto exit_mem;
                 npw = nprompt;
             } else if (!new_password || strcmp(new_password, "-") == 0) {
-                fprintf(stderr, "New password: ");
-                fflush(stderr);
-                nprompt = read_pass_from_fd(STDIN_FILENO);
+                nprompt = read_pass_from_fd(STDIN_FILENO, "New password: ");
                 if (!nprompt) goto exit_mem;
                 npw = nprompt;
             } else {

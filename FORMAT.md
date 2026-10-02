@@ -150,7 +150,12 @@ size.
 With `FLAG_COMPRESSED`, each frame's plaintext is an independent zlib/gzip
 member (`deflateInit2(windowBits=15+16)`, finished and reset per frame);
 decompressors must `inflateReset()` between frames. Without the flag,
-plaintext is raw file bytes in order.
+plaintext is raw file bytes in order. A zero-length `TAG_FINAL` frame is
+valid under either flag (empty input) and carries nothing to decompress.
+
+The writer sets `FLAG_COMPRESSED` only when a probe of the input (up to four
+64 KiB samples, deflated) saves at least ~5%; the probe decision is made
+before the header is written and readers need no knowledge of it.
 
 ## Directory bundle layout (`FLAG_DIRECTORY`)
 
